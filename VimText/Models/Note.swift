@@ -4,6 +4,7 @@ struct Note: Identifiable, Codable, Hashable {
     let id: UUID
     var title: String
     var content: String
+    var rtfData: Data?
     var folderId: UUID?
     var createdAt: Date
     var modifiedAt: Date
@@ -13,6 +14,7 @@ struct Note: Identifiable, Codable, Hashable {
         id: UUID = UUID(),
         title: String = "New Note",
         content: String = "",
+        rtfData: Data? = nil,
         folderId: UUID? = nil,
         createdAt: Date = Date(),
         modifiedAt: Date = Date(),
@@ -21,6 +23,7 @@ struct Note: Identifiable, Codable, Hashable {
         self.id = id
         self.title = title
         self.content = content
+        self.rtfData = rtfData
         self.folderId = folderId
         self.createdAt = createdAt
         self.modifiedAt = modifiedAt

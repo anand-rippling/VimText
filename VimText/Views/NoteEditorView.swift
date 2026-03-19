@@ -6,6 +6,7 @@ struct NoteEditorView: View {
 
     @StateObject private var vimEngine = VimEngine()
     @State private var content: String = ""
+    @State private var rtfData: Data = Data()
     @State private var hasLoaded = false
     @State private var startInInsertMode = false
     @AppStorage("editorFontSize") private var fontSize: Double = 15
@@ -38,6 +39,7 @@ struct NoteEditorView: View {
     private var editorArea: some View {
         VimTextView(
             text: $content,
+            rtfData: $rtfData,
             vimEngine: vimEngine,
             onSave: { saveCurrentNote() },
             font: editorFont,
@@ -45,7 +47,12 @@ struct NoteEditorView: View {
         )
         .onChange(of: content) { _, newValue in
             let newTitle = extractTitle(from: newValue)
-            viewModel.updateNoteContent(id: noteId, title: newTitle.isEmpty ? "Untitled" : newTitle, content: newValue)
+            viewModel.updateNoteContent(id: noteId, title: newTitle.isEmpty ? "Untitled" : newTitle, content: newValue, rtfData: rtfData)
+        }
+        .onChange(of: rtfData) { _, newValue in
+            // Save formatting-only changes (e.g. Cmd+B on selection doesn't change plain text)
+            let title = extractTitle(from: content)
+            viewModel.updateNoteContent(id: noteId, title: title.isEmpty ? "Untitled" : title, content: content, rtfData: newValue)
         }
     }
 
@@ -140,6 +147,7 @@ struct NoteEditorView: View {
     private func loadNote() {
         if let note = viewModel.notes.first(where: { $0.id == noteId }) {
             content = note.content
+            rtfData = note.rtfData ?? Data()
             hasLoaded = true
             let isNewEmpty = note.content.isEmpty
             startInInsertMode = isNewEmpty
@@ -152,7 +160,7 @@ struct NoteEditorView: View {
 
     private func saveCurrentNote() {
         let title = extractTitle(from: content)
-        viewModel.updateNoteContent(id: noteId, title: title.isEmpty ? "Untitled" : title, content: content)
+        viewModel.updateNoteContent(id: noteId, title: title.isEmpty ? "Untitled" : title, content: content, rtfData: rtfData)
     }
 
     private func extractTitle(from text: String) -> String {

@@ -155,13 +155,15 @@ final class NotesViewModel: ObservableObject {
         storage.saveNote(notes[index])
     }
 
-    func updateNoteContent(id: UUID, title: String, content: String) {
+    func updateNoteContent(id: UUID, title: String, content: String, rtfData: Data? = nil) {
         guard let index = notes.firstIndex(where: { $0.id == id }) else { return }
         let contentChanged = notes[index].content != content
         let titleChanged = notes[index].title != title
-        guard contentChanged || titleChanged else { return }
+        let rtfChanged = notes[index].rtfData != rtfData
+        guard contentChanged || titleChanged || rtfChanged else { return }
         notes[index].title = title
         notes[index].content = content
+        notes[index].rtfData = rtfData
         notes[index].modifiedAt = Date()
         storage.saveNote(notes[index])
     }

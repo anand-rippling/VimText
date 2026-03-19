@@ -3,6 +3,7 @@ import AppKit
 
 struct VimTextView: NSViewRepresentable {
     @Binding var text: String
+    @Binding var rtfData: Data
     @ObservedObject var vimEngine: VimEngine
     var onSave: (() -> Void)?
     var font: NSFont
@@ -24,9 +25,7 @@ struct VimTextView: NSViewRepresentable {
         textView.isEditable = true
         textView.isSelectable = true
         textView.allowsUndo = true
-        textView.isRichText = false
-        textView.font = font
-        textView.textColor = NSColor.labelColor
+        textView.isRichText = true
         textView.backgroundColor = NSColor.textBackgroundColor
         textView.drawsBackground = true
         textView.isAutomaticQuoteSubstitutionEnabled = false
@@ -50,6 +49,13 @@ struct VimTextView: NSViewRepresentable {
 
         textView.insertionPointColor = NSColor.systemOrange
 
+        // Set default typing attributes for rich text
+        let defaultAttrs: [NSAttributedString.Key: Any] = [
+            .font: font,
+            .foregroundColor: NSColor.labelColor
+        ]
+        textView.typingAttributes = defaultAttrs
+
         textView.delegate = context.coordinator
         textView.vimEngine = vimEngine
         textView.coordinator = context.coordinator
@@ -58,8 +64,15 @@ struct VimTextView: NSViewRepresentable {
 
         context.coordinator.textView = textView
         context.coordinator.scrollView = scrollView
+        context.coordinator.lastFontSize = font.pointSize
 
-        textView.string = text
+        // Load rich text content or fall back to plain text
+        if !rtfData.isEmpty, let attrStr = NSAttributedString(rtf: rtfData, documentAttributes: nil) {
+            textView.textStorage?.setAttributedString(attrStr)
+        } else {
+            let attrStr = NSAttributedString(string: text, attributes: defaultAttrs)
+            textView.textStorage?.setAttributedString(attrStr)
+        }
 
         let isInsert = vimEngine.mode.isEditing || startInInsertMode
         textView.updateCursorAppearance(isBlock: !isInsert)
@@ -72,12 +85,26 @@ struct VimTextView: NSViewRepresentable {
 
         if !context.coordinator.isUpdatingFromTextView && textView.string != text {
             let selectedRange = textView.selectedRange()
-            textView.string = text
+            let defaultAttrs: [NSAttributedString.Key: Any] = [
+                .font: font,
+                .foregroundColor: NSColor.labelColor
+            ]
+            if !rtfData.isEmpty, let attrStr = NSAttributedString(rtf: rtfData, documentAttributes: nil) {
+                textView.textStorage?.setAttributedString(attrStr)
+            } else {
+                let attrStr = NSAttributedString(string: text, attributes: defaultAttrs)
+                textView.textStorage?.setAttributedString(attrStr)
+            }
             let safeLocation = min(selectedRange.location, textView.string.count)
             textView.setSelectedRange(NSRange(location: safeLocation, length: 0))
         }
 
-        textView.font = font
+        // Update font size across the document when it changes (preserving bold/italic)
+        if context.coordinator.lastFontSize != font.pointSize {
+            context.coordinator.lastFontSize = font.pointSize
+            textView.updateFontSize(font.pointSize)
+        }
+
         textView.updateCursorAppearance(isBlock: !vimEngine.mode.isEditing)
     }
 
@@ -103,6 +130,7 @@ struct VimTextView: NSViewRepresentable {
         var insertModeStartContent: String = ""
         var insertModeStartPos: Int = 0
         var isReplayingDot: Bool = false
+        var lastFontSize: CGFloat = 0
 
         init(_ parent: VimTextView) {
             self.parent = parent
@@ -112,6 +140,31 @@ struct VimTextView: NSViewRepresentable {
             guard let textView = notification.object as? NSTextView else { return }
             isUpdatingFromTextView = true
             parent.text = textView.string
+
+            // Export RTF data to preserve rich text formatting
+            if let textStorage = textView.textStorage, textStorage.length > 0 {
+                let range = NSRange(location: 0, length: textStorage.length)
+                if let data = try? textStorage.data(from: range, documentAttributes: [.documentType: NSAttributedString.DocumentType.rtf]) {
+                    parent.rtfData = data
+                }
+            } else {
+                parent.rtfData = Data()
+            }
+
+            DispatchQueue.main.async {
+                self.isUpdatingFromTextView = false
+            }
+        }
+
+        func formattingDidChange() {
+            guard let textView = textView else { return }
+            isUpdatingFromTextView = true
+            if let textStorage = textView.textStorage, textStorage.length > 0 {
+                let range = NSRange(location: 0, length: textStorage.length)
+                if let data = try? textStorage.data(from: range, documentAttributes: [.documentType: NSAttributedString.DocumentType.rtf]) {
+                    parent.rtfData = data
+                }
+            }
             DispatchQueue.main.async {
                 self.isUpdatingFromTextView = false
             }
@@ -1660,6 +1713,118 @@ class VimNSTextView: NSTextView {
         searchHighlightLayers.removeAll()
     }
 
+    // MARK: - Rich Text Formatting
+
+    func toggleBoldFormatting() {
+        let fontManager = NSFontManager.shared
+        let range = selectedRange()
+
+        if range.length > 0 {
+            guard let textStorage = textStorage else { return }
+            textStorage.beginEditing()
+            textStorage.enumerateAttribute(.font, in: range, options: []) { value, attrRange, _ in
+                guard let currentFont = value as? NSFont else { return }
+                let newFont: NSFont
+                if fontManager.traits(of: currentFont).contains(.boldFontMask) {
+                    newFont = fontManager.convert(currentFont, toNotHaveTrait: .boldFontMask)
+                } else {
+                    newFont = fontManager.convert(currentFont, toHaveTrait: .boldFontMask)
+                }
+                textStorage.addAttribute(.font, value: newFont, range: attrRange)
+            }
+            textStorage.endEditing()
+        } else {
+            var attrs = typingAttributes
+            if let currentFont = attrs[.font] as? NSFont {
+                let newFont: NSFont
+                if fontManager.traits(of: currentFont).contains(.boldFontMask) {
+                    newFont = fontManager.convert(currentFont, toNotHaveTrait: .boldFontMask)
+                } else {
+                    newFont = fontManager.convert(currentFont, toHaveTrait: .boldFontMask)
+                }
+                attrs[.font] = newFont
+                typingAttributes = attrs
+            }
+        }
+        coordinator?.formattingDidChange()
+        vimEngine?.statusMessage = range.length > 0 ? "Bold toggled" : "Bold mode toggled"
+    }
+
+    func toggleItalicFormatting() {
+        let fontManager = NSFontManager.shared
+        let range = selectedRange()
+
+        if range.length > 0 {
+            guard let textStorage = textStorage else { return }
+            textStorage.beginEditing()
+            textStorage.enumerateAttribute(.font, in: range, options: []) { value, attrRange, _ in
+                guard let currentFont = value as? NSFont else { return }
+                let newFont: NSFont
+                if fontManager.traits(of: currentFont).contains(.italicFontMask) {
+                    newFont = fontManager.convert(currentFont, toNotHaveTrait: .italicFontMask)
+                } else {
+                    newFont = fontManager.convert(currentFont, toHaveTrait: .italicFontMask)
+                }
+                textStorage.addAttribute(.font, value: newFont, range: attrRange)
+            }
+            textStorage.endEditing()
+        } else {
+            var attrs = typingAttributes
+            if let currentFont = attrs[.font] as? NSFont {
+                let newFont: NSFont
+                if fontManager.traits(of: currentFont).contains(.italicFontMask) {
+                    newFont = fontManager.convert(currentFont, toNotHaveTrait: .italicFontMask)
+                } else {
+                    newFont = fontManager.convert(currentFont, toHaveTrait: .italicFontMask)
+                }
+                attrs[.font] = newFont
+                typingAttributes = attrs
+            }
+        }
+        coordinator?.formattingDidChange()
+        vimEngine?.statusMessage = range.length > 0 ? "Italic toggled" : "Italic mode toggled"
+    }
+
+    func toggleUnderlineFormatting() {
+        let range = selectedRange()
+
+        if range.length > 0 {
+            guard let textStorage = textStorage else { return }
+            let currentVal = textStorage.attribute(.underlineStyle, at: range.location, effectiveRange: nil) as? Int ?? 0
+            let newVal = currentVal == 0 ? NSUnderlineStyle.single.rawValue : 0
+            textStorage.beginEditing()
+            textStorage.addAttribute(.underlineStyle, value: newVal, range: range)
+            textStorage.endEditing()
+        } else {
+            var attrs = typingAttributes
+            let currentVal = attrs[.underlineStyle] as? Int ?? 0
+            attrs[.underlineStyle] = currentVal == 0 ? NSUnderlineStyle.single.rawValue : 0
+            typingAttributes = attrs
+        }
+        coordinator?.formattingDidChange()
+        vimEngine?.statusMessage = range.length > 0 ? "Underline toggled" : "Underline mode toggled"
+    }
+
+    func updateFontSize(_ newSize: CGFloat) {
+        guard let textStorage = textStorage else { return }
+        let fullRange = NSRange(location: 0, length: textStorage.length)
+        if fullRange.length > 0 {
+            textStorage.beginEditing()
+            textStorage.enumerateAttribute(.font, in: fullRange, options: []) { value, range, _ in
+                guard let currentFont = value as? NSFont else { return }
+                let newFont = NSFont(descriptor: currentFont.fontDescriptor, size: newSize) ?? currentFont
+                textStorage.addAttribute(.font, value: newFont, range: range)
+            }
+            textStorage.endEditing()
+        }
+        // Also update typing attributes
+        var attrs = typingAttributes
+        if let currentFont = attrs[.font] as? NSFont {
+            attrs[.font] = NSFont(descriptor: currentFont.fontDescriptor, size: newSize) ?? currentFont
+            typingAttributes = attrs
+        }
+    }
+
     override var acceptsFirstResponder: Bool { true }
 
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
@@ -1707,6 +1872,19 @@ class VimNSTextView: NSTextView {
                 } else {
                     performTextFinderAction(NSTextFinder.Action.nextMatch)
                 }
+                return true
+            }
+            // Rich text formatting: Cmd+B (bold), Cmd+I (italic), Cmd+U (underline)
+            if event.charactersIgnoringModifiers == "b" && !hasShift {
+                toggleBoldFormatting()
+                return true
+            }
+            if event.charactersIgnoringModifiers == "i" && !hasShift {
+                toggleItalicFormatting()
+                return true
+            }
+            if event.charactersIgnoringModifiers == "u" && !hasShift {
+                toggleUnderlineFormatting()
                 return true
             }
         }
