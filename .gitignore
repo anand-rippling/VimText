@@ -1,0 +1,8 @@
+.DS_Store
+.build/
+VimText.app/
+*.xcodeproj/
+DerivedData/
+*.swp
+*.swo
+*~

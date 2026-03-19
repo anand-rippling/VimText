@@ -1,0 +1,1911 @@
+import SwiftUI
+import AppKit
+
+struct VimTextView: NSViewRepresentable {
+    @Binding var text: String
+    @ObservedObject var vimEngine: VimEngine
+    var onSave: (() -> Void)?
+    var font: NSFont
+    var startInInsertMode: Bool = false
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(self)
+    }
+
+    func makeNSView(context: Context) -> NSScrollView {
+        let scrollView = NSScrollView()
+        scrollView.hasVerticalScroller = true
+        scrollView.hasHorizontalScroller = false
+        scrollView.autohidesScrollers = true
+        scrollView.drawsBackground = false
+        scrollView.borderType = .noBorder
+
+        let textView = VimNSTextView()
+        textView.isEditable = true
+        textView.isSelectable = true
+        textView.allowsUndo = true
+        textView.isRichText = false
+        textView.font = font
+        textView.textColor = NSColor.labelColor
+        textView.backgroundColor = NSColor.textBackgroundColor
+        textView.drawsBackground = true
+        textView.isAutomaticQuoteSubstitutionEnabled = false
+        textView.isAutomaticDashSubstitutionEnabled = false
+        textView.isAutomaticTextReplacementEnabled = false
+        textView.isAutomaticSpellingCorrectionEnabled = false
+        textView.isContinuousSpellCheckingEnabled = false
+        textView.isAutomaticTextCompletionEnabled = false
+        textView.isAutomaticLinkDetectionEnabled = false
+        textView.usesFindBar = true
+        textView.isIncrementalSearchingEnabled = true
+        textView.textContainerInset = NSSize(width: 16, height: 16)
+
+        textView.minSize = NSSize(width: 0, height: 0)
+        textView.maxSize = NSSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude)
+        textView.isVerticallyResizable = true
+        textView.isHorizontallyResizable = false
+        textView.autoresizingMask = [.width]
+        textView.textContainer?.containerSize = NSSize(width: scrollView.contentSize.width, height: CGFloat.greatestFiniteMagnitude)
+        textView.textContainer?.widthTracksTextView = true
+
+        textView.insertionPointColor = NSColor.systemOrange
+
+        textView.delegate = context.coordinator
+        textView.vimEngine = vimEngine
+        textView.coordinator = context.coordinator
+
+        scrollView.documentView = textView
+
+        context.coordinator.textView = textView
+        context.coordinator.scrollView = scrollView
+
+        textView.string = text
+
+        let isInsert = vimEngine.mode.isEditing || startInInsertMode
+        textView.updateCursorAppearance(isBlock: !isInsert)
+
+        return scrollView
+    }
+
+    func updateNSView(_ scrollView: NSScrollView, context: Context) {
+        guard let textView = scrollView.documentView as? VimNSTextView else { return }
+
+        if !context.coordinator.isUpdatingFromTextView && textView.string != text {
+            let selectedRange = textView.selectedRange()
+            textView.string = text
+            let safeLocation = min(selectedRange.location, textView.string.count)
+            textView.setSelectedRange(NSRange(location: safeLocation, length: 0))
+        }
+
+        textView.font = font
+        textView.updateCursorAppearance(isBlock: !vimEngine.mode.isEditing)
+    }
+
+    class Coordinator: NSObject, NSTextViewDelegate {
+        var parent: VimTextView
+        weak var textView: VimNSTextView?
+        weak var scrollView: NSScrollView?
+        var isUpdatingFromTextView = false
+        var visualAnchor: Int = 0
+        var visualCursorPos: Int = 0
+        private var yankHighlightLayer: CALayer?
+        private var searchHighlightTimer: DispatchWorkItem?
+        private var blockHighlightLayers: [CALayer] = []
+        var blockInsertText: String?
+        var lastBlockRanges: [NSRange] = []
+        var wasInBlockMode = false
+        var blockInsertStartPos: Int?
+        var blockInsertIsAppend = false
+        var blockInsertColumn: Int = 0
+        var blockInsertLineCount: Int = 0
+        var blockInsertFirstLineStart: Int = 0
+
+        var insertModeStartContent: String = ""
+        var insertModeStartPos: Int = 0
+        var isReplayingDot: Bool = false
+
+        init(_ parent: VimTextView) {
+            self.parent = parent
+        }
+
+        func textDidChange(_ notification: Notification) {
+            guard let textView = notification.object as? NSTextView else { return }
+            isUpdatingFromTextView = true
+            parent.text = textView.string
+            DispatchQueue.main.async {
+                self.isUpdatingFromTextView = false
+            }
+        }
+
+        func textView(_ textView: NSTextView, doCommandBy commandSelector: Selector) -> Bool {
+            return false
+        }
+
+        func executeActions(_ actions: [VimAction]) {
+            guard let textView = textView else { return }
+            let engine = parent.vimEngine
+
+            if !isReplayingDot {
+                let isChangeAction = actions.contains { action in
+                    switch action {
+                    case .insertMode, .deleteMotion, .deleteLine, .deleteToEnd, .deleteChar,
+                         .deleteCharBefore, .changeMotion, .changeLine, .changeToEnd,
+                         .deleteTextObject, .changeTextObject, .toggleCase, .joinLines,
+                         .pasteAfter, .pasteBefore, .indent, .outdent, .replaceChar:
+                        return true
+                    default:
+                        return false
+                    }
+                }
+                let entersInsert = actions.contains { action in
+                    switch action {
+                    case .insertMode, .changeMotion, .changeLine, .changeToEnd, .changeTextObject:
+                        return true
+                    default:
+                        return false
+                    }
+                }
+
+                if isChangeAction {
+                    if entersInsert {
+                        engine.startRecordingChange(actions: actions)
+                    } else {
+                        engine.recordNonInsertChange(actions: actions)
+                    }
+                }
+            }
+
+            for action in actions {
+                executeAction(action, in: textView)
+            }
+        }
+
+        func executeAction(_ action: VimAction, in textView: VimNSTextView) {
+            let string = textView.string
+            let nsString = string as NSString
+            let cursorPos = textView.selectedRange().location
+            let length = nsString.length
+            let engine = parent.vimEngine
+            let isVisual = engine.mode.isVisual
+
+            switch action {
+            case .none:
+                break
+
+            case .moveCursor(let motion):
+                let newPos: Int
+                if isVisual {
+                    let savedRange = textView.selectedRange()
+                    textView.setSelectedRange(NSRange(location: visualCursorPos, length: 0))
+                    newPos = resolveMotion(motion, in: textView)
+                    textView.setSelectedRange(savedRange)
+                    visualCursorPos = newPos
+                    if engine.mode == .visualBlock {
+                        updateBlockSelection(in: textView)
+                    } else {
+                        updateVisualSelection(cursorAt: newPos, in: textView)
+                    }
+                } else {
+                    newPos = resolveMotion(motion, in: textView)
+                    textView.setSelectedRange(NSRange(location: newPos, length: 0))
+                }
+                textView.scrollRangeToVisible(NSRange(location: newPos, length: 0))
+
+            case .insertMode(let entry):
+                handleInsertEntry(entry, in: textView)
+                textView.updateCursorAppearance(isBlock: false)
+                textView.clearSearchHighlights()
+                if !isReplayingDot {
+                    insertModeStartContent = textView.string
+                    insertModeStartPos = textView.selectedRange().location
+                }
+
+            case .normalMode:
+                textView.visualCursorOverride = nil
+                clearBlockHighlights(in: textView)
+
+                if !isReplayingDot && engine.isRecordingChange {
+                    let currentContent = textView.string
+                    let oldLen = insertModeStartContent.count
+                    let newLen = currentContent.count
+                    if newLen >= oldLen {
+                        let diffLen = newLen - oldLen
+                        if diffLen > 0 && insertModeStartPos <= currentContent.count {
+                            let startIdx = currentContent.index(currentContent.startIndex, offsetBy: min(insertModeStartPos, currentContent.count))
+                            let endIdx = currentContent.index(startIdx, offsetBy: min(diffLen, currentContent.count - insertModeStartPos))
+                            let typed = String(currentContent[startIdx..<endIdx])
+                            engine.finalizeChange(insertedText: typed)
+                        } else {
+                            engine.finalizeChange(insertedText: "")
+                        }
+                    } else {
+                        engine.finalizeChange(insertedText: "")
+                    }
+                }
+
+                if let startPos = blockInsertStartPos, wasInBlockMode, blockInsertLineCount > 1 {
+                    let currentPos = textView.selectedRange().location
+                    if currentPos > startPos {
+                        let insertedText = (textView.string as NSString).substring(with: NSRange(location: startPos, length: currentPos - startPos))
+                        let firstLineNs = textView.string as NSString
+                        let firstLR = firstLineNs.lineRange(for: NSRange(location: startPos, length: 0))
+                        var nextLineStart = firstLR.location + firstLR.length
+
+                        for _ in 1..<blockInsertLineCount {
+                            let currentNs = textView.string as NSString
+                            if nextLineStart >= currentNs.length { break }
+                            let lr = currentNs.lineRange(for: NSRange(location: nextLineStart, length: 0))
+                            let targetPos = positionForColumn(blockInsertColumn, inLineAt: lr.location, in: currentNs)
+                            textView.insertText(insertedText, replacementRange: NSRange(location: targetPos, length: 0))
+                            let updatedNs = textView.string as NSString
+                            let updatedLR = updatedNs.lineRange(for: NSRange(location: targetPos, length: 0))
+                            nextLineStart = updatedLR.location + updatedLR.length
+                        }
+                    }
+                    blockInsertStartPos = nil
+                    wasInBlockMode = false
+                    lastBlockRanges = []
+                }
+
+                let sel = textView.selectedRange()
+                let newLength = (textView.string as NSString).length
+                let pos = sel.location
+                textView.setSelectedRange(NSRange(location: pos, length: 0))
+                if pos > 0 && pos == newLength {
+                    textView.setSelectedRange(NSRange(location: pos - 1, length: 0))
+                }
+                textView.updateCursorAppearance(isBlock: true)
+
+            case .visualMode:
+                clearBlockHighlights(in: textView)
+                visualAnchor = cursorPos
+                visualCursorPos = cursorPos
+                textView.visualCursorOverride = cursorPos
+                let selLen = min(1, length - cursorPos)
+                textView.setSelectedRange(NSRange(location: cursorPos, length: selLen))
+
+            case .visualLineMode:
+                clearBlockHighlights(in: textView)
+                visualAnchor = cursorPos
+                visualCursorPos = cursorPos
+                textView.visualCursorOverride = cursorPos
+                let lineRange = nsString.lineRange(for: NSRange(location: cursorPos, length: 0))
+                textView.setSelectedRange(lineRange)
+
+            case .visualBlockMode:
+                visualAnchor = cursorPos
+                visualCursorPos = cursorPos
+                textView.visualCursorOverride = cursorPos
+                textView.setSelectedRange(NSRange(location: cursorPos, length: 0))
+                updateBlockSelection(in: textView)
+
+            case .commandMode:
+                break
+
+            case .replaceChar:
+                break
+
+            case .toggleCase:
+                if cursorPos < length {
+                    let charRange = NSRange(location: cursorPos, length: 1)
+                    let ch = nsString.substring(with: charRange)
+                    let toggled = ch == ch.uppercased() ? ch.lowercased() : ch.uppercased()
+                    textView.insertText(toggled, replacementRange: charRange)
+                    let newPos = min(cursorPos + 1, length - 1)
+                    textView.setSelectedRange(NSRange(location: max(newPos, 0), length: 0))
+                }
+
+            case .repeatLastChange:
+                let savedActions = engine.lastChangeActions
+                let savedInsertedText = engine.lastInsertedText
+                guard !savedActions.isEmpty else { break }
+
+                isReplayingDot = true
+
+                let entersInsert = savedActions.contains { a in
+                    switch a {
+                    case .insertMode, .changeMotion, .changeLine, .changeToEnd, .changeTextObject:
+                        return true
+                    default:
+                        return false
+                    }
+                }
+
+                for a in savedActions {
+                    if case .replaceChar = a {
+                        let pos = textView.selectedRange().location
+                        let ns = textView.string as NSString
+                        if pos < ns.length && !engine.lastReplaceChar.isEmpty {
+                            textView.setSelectedRange(NSRange(location: pos, length: 1))
+                            textView.insertText(engine.lastReplaceChar, replacementRange: NSRange(location: pos, length: 1))
+                            textView.setSelectedRange(NSRange(location: pos, length: 0))
+                        }
+                    } else {
+                        executeAction(a, in: textView)
+                    }
+                }
+
+                if entersInsert && !savedInsertedText.isEmpty {
+                    textView.insertText(savedInsertedText, replacementRange: textView.selectedRange())
+                }
+
+                if entersInsert {
+                    engine.mode = .normal
+                    let pos = textView.selectedRange().location
+                    let ns = textView.string as NSString
+                    if pos > 0 && pos <= ns.length {
+                        textView.setSelectedRange(NSRange(location: pos - 1, length: 0))
+                    }
+                    textView.updateCursorAppearance(isBlock: true)
+                }
+
+                isReplayingDot = false
+
+            case .deleteChar:
+                if cursorPos < length {
+                    textView.setSelectedRange(NSRange(location: cursorPos, length: 1))
+                    textView.delete(nil)
+                }
+
+            case .deleteCharBefore:
+                if cursorPos > 0 {
+                    textView.setSelectedRange(NSRange(location: cursorPos - 1, length: 1))
+                    textView.delete(nil)
+                }
+
+            case .deleteLine:
+                let lineRange = nsString.lineRange(for: NSRange(location: cursorPos, length: 0))
+                let lineText = nsString.substring(with: lineRange)
+                parent.vimEngine.register = lineText
+                textView.setSelectedRange(lineRange)
+                textView.delete(nil)
+
+            case .deleteToEnd:
+                let lineRange = nsString.lineRange(for: NSRange(location: cursorPos, length: 0))
+                let lineEnd = lineRange.location + lineRange.length
+                let deleteEnd = lineEnd > 0 && nsString.character(at: lineEnd - 1) == 0x0A ? lineEnd - 1 : lineEnd
+                if cursorPos < deleteEnd {
+                    let range = NSRange(location: cursorPos, length: deleteEnd - cursorPos)
+                    parent.vimEngine.register = nsString.substring(with: range)
+                    textView.setSelectedRange(range)
+                    textView.delete(nil)
+                }
+
+            case .deleteMotion(let motion, let count):
+                let target = resolveMotionNTimes(motion, count: count, in: textView)
+                if motion.isLinewise {
+                    let startLine = nsString.lineRange(for: NSRange(location: min(cursorPos, target), length: 0))
+                    let endLine = nsString.lineRange(for: NSRange(location: max(cursorPos, target), length: 0))
+                    let range = NSRange(location: startLine.location, length: NSMaxRange(endLine) - startLine.location)
+                    if range.length > 0 {
+                        parent.vimEngine.register = nsString.substring(with: range)
+                        textView.setSelectedRange(range)
+                        textView.delete(nil)
+                    }
+                } else {
+                    let start = min(cursorPos, target)
+                    var end = max(cursorPos, target)
+                    if motion.isInclusive && end < length { end += 1 }
+                    if start < end {
+                        let range = NSRange(location: start, length: end - start)
+                        parent.vimEngine.register = nsString.substring(with: range)
+                        textView.setSelectedRange(range)
+                        textView.delete(nil)
+                    }
+                }
+
+            case .changeLine:
+                let lineRange = nsString.lineRange(for: NSRange(location: cursorPos, length: 0))
+                var contentRange = lineRange
+                if contentRange.length > 0 && nsString.character(at: contentRange.location + contentRange.length - 1) == 0x0A {
+                    contentRange.length -= 1
+                }
+                parent.vimEngine.register = nsString.substring(with: contentRange)
+                textView.setSelectedRange(contentRange)
+                textView.delete(nil)
+                textView.updateCursorAppearance(isBlock: false)
+                if !isReplayingDot {
+                    insertModeStartContent = textView.string
+                    insertModeStartPos = textView.selectedRange().location
+                }
+
+            case .changeToEnd:
+                let lineRange = nsString.lineRange(for: NSRange(location: cursorPos, length: 0))
+                let lineEnd = lineRange.location + lineRange.length
+                let end = lineEnd > 0 && nsString.character(at: lineEnd - 1) == 0x0A ? lineEnd - 1 : lineEnd
+                if cursorPos < end {
+                    let range = NSRange(location: cursorPos, length: end - cursorPos)
+                    parent.vimEngine.register = nsString.substring(with: range)
+                    textView.setSelectedRange(range)
+                    textView.delete(nil)
+                }
+                textView.updateCursorAppearance(isBlock: false)
+                if !isReplayingDot {
+                    insertModeStartContent = textView.string
+                    insertModeStartPos = textView.selectedRange().location
+                }
+
+            case .changeMotion(let motion, let count):
+                let target = resolveMotionNTimes(motion, count: count, in: textView)
+                if motion.isLinewise {
+                    let startLine = nsString.lineRange(for: NSRange(location: min(cursorPos, target), length: 0))
+                    let endLine = nsString.lineRange(for: NSRange(location: max(cursorPos, target), length: 0))
+                    var rangeEnd = NSMaxRange(endLine)
+                    if rangeEnd > startLine.location && nsString.character(at: rangeEnd - 1) == 0x0A {
+                        rangeEnd -= 1
+                    }
+                    let range = NSRange(location: startLine.location, length: rangeEnd - startLine.location)
+                    if range.length > 0 {
+                        parent.vimEngine.register = nsString.substring(with: range)
+                        textView.setSelectedRange(range)
+                        textView.delete(nil)
+                    }
+                } else {
+                    let start = min(cursorPos, target)
+                    var end = max(cursorPos, target)
+                    if motion.isInclusive && end < length { end += 1 }
+                    if start < end {
+                        let range = NSRange(location: start, length: end - start)
+                        parent.vimEngine.register = nsString.substring(with: range)
+                        textView.setSelectedRange(range)
+                        textView.delete(nil)
+                    }
+                }
+                textView.updateCursorAppearance(isBlock: false)
+                if !isReplayingDot {
+                    insertModeStartContent = textView.string
+                    insertModeStartPos = textView.selectedRange().location
+                }
+
+            case .yankLine:
+                let lineRange = nsString.lineRange(for: NSRange(location: cursorPos, length: 0))
+                parent.vimEngine.register = nsString.substring(with: lineRange)
+                parent.vimEngine.statusMessage = "1 line yanked"
+                flashYankHighlight(range: lineRange, in: textView)
+
+            case .yankMotion(let motion, let count):
+                let target = resolveMotionNTimes(motion, count: count, in: textView)
+                if motion.isLinewise {
+                    let startLine = nsString.lineRange(for: NSRange(location: min(cursorPos, target), length: 0))
+                    let endLine = nsString.lineRange(for: NSRange(location: max(cursorPos, target), length: 0))
+                    let range = NSRange(location: startLine.location, length: NSMaxRange(endLine) - startLine.location)
+                    if range.length > 0 {
+                        parent.vimEngine.register = nsString.substring(with: range)
+                        parent.vimEngine.statusMessage = "Yanked"
+                        flashYankHighlight(range: range, in: textView)
+                    }
+                } else {
+                    let start = min(cursorPos, target)
+                    var end = max(cursorPos, target)
+                    if motion.isInclusive && end < length { end += 1 }
+                    if start < end {
+                        let range = NSRange(location: start, length: end - start)
+                        parent.vimEngine.register = nsString.substring(with: range)
+                        parent.vimEngine.statusMessage = "Yanked"
+                        flashYankHighlight(range: range, in: textView)
+                    }
+                }
+
+            case .pasteAfter:
+                let reg = pasteContent()
+                guard !reg.isEmpty else { break }
+                if reg.hasSuffix("\n") {
+                    let lineRange = nsString.lineRange(for: NSRange(location: cursorPos, length: 0))
+                    let insertPos = lineRange.location + lineRange.length
+                    textView.setSelectedRange(NSRange(location: insertPos, length: 0))
+                    textView.insertText(reg, replacementRange: NSRange(location: insertPos, length: 0))
+                    textView.setSelectedRange(NSRange(location: insertPos, length: 0))
+                } else {
+                    let insertPos = min(cursorPos + 1, length)
+                    textView.setSelectedRange(NSRange(location: insertPos, length: 0))
+                    textView.insertText(reg, replacementRange: NSRange(location: insertPos, length: 0))
+                }
+
+            case .pasteBefore:
+                let reg = pasteContent()
+                guard !reg.isEmpty else { break }
+                if reg.hasSuffix("\n") {
+                    let lineRange = nsString.lineRange(for: NSRange(location: cursorPos, length: 0))
+                    textView.setSelectedRange(NSRange(location: lineRange.location, length: 0))
+                    textView.insertText(reg, replacementRange: NSRange(location: lineRange.location, length: 0))
+                    textView.setSelectedRange(NSRange(location: lineRange.location, length: 0))
+                } else {
+                    textView.insertText(reg, replacementRange: NSRange(location: cursorPos, length: 0))
+                }
+
+            case .joinLines:
+                let lineRange = nsString.lineRange(for: NSRange(location: cursorPos, length: 0))
+                let lineEnd = lineRange.location + lineRange.length
+                if lineEnd < length {
+                    let nextLineRange = nsString.lineRange(for: NSRange(location: lineEnd, length: 0))
+                    let nextLine = nsString.substring(with: nextLineRange)
+                    let trimmed = nextLine.trimmingCharacters(in: .whitespacesAndNewlines)
+                    let joinEnd = lineEnd > 0 && nsString.character(at: lineEnd - 1) == 0x0A ? lineEnd - 1 : lineEnd
+                    let replaceRange = NSRange(location: joinEnd, length: nextLineRange.length)
+                    textView.setSelectedRange(replaceRange)
+                    textView.insertText(" " + trimmed, replacementRange: replaceRange)
+                }
+
+            case .undo:
+                textView.undoManager?.undo()
+
+            case .redo:
+                textView.undoManager?.redo()
+
+            case .indent:
+                let lineRange = nsString.lineRange(for: NSRange(location: cursorPos, length: 0))
+                textView.setSelectedRange(NSRange(location: lineRange.location, length: 0))
+                textView.insertText("    ", replacementRange: NSRange(location: lineRange.location, length: 0))
+
+            case .outdent:
+                let lineRange = nsString.lineRange(for: NSRange(location: cursorPos, length: 0))
+                let lineText = nsString.substring(with: lineRange)
+                var removeCount = 0
+                for ch in lineText {
+                    if ch == " " && removeCount < 4 {
+                        removeCount += 1
+                    } else if ch == "\t" && removeCount == 0 {
+                        removeCount = 1
+                        break
+                    } else {
+                        break
+                    }
+                }
+                if removeCount > 0 {
+                    let removeRange = NSRange(location: lineRange.location, length: removeCount)
+                    textView.setSelectedRange(removeRange)
+                    textView.delete(nil)
+                }
+
+            case .searchForward, .searchBackward:
+                break
+
+            case .searchExecute(let term, let forward):
+                textView.highlightAllMatches(term: term)
+                searchAndMoveCursor(term: term, forward: forward, in: textView)
+                scheduleSearchHighlightClear(for: textView)
+
+            case .nextMatch:
+                let term = parent.vimEngine.searchTerm
+                guard !term.isEmpty else { break }
+                textView.highlightAllMatches(term: term)
+                searchAndMoveCursor(term: term, forward: parent.vimEngine.searchForwardDirection, in: textView)
+                parent.vimEngine.statusMessage = "/\(term)"
+                scheduleSearchHighlightClear(for: textView)
+
+            case .previousMatch:
+                let term = parent.vimEngine.searchTerm
+                guard !term.isEmpty else { break }
+                textView.highlightAllMatches(term: term)
+                searchAndMoveCursor(term: term, forward: !parent.vimEngine.searchForwardDirection, in: textView)
+                parent.vimEngine.statusMessage = "?\(term)"
+                scheduleSearchHighlightClear(for: textView)
+
+            case .goToLine(let line):
+                let lines = string.components(separatedBy: "\n")
+                let targetLine = max(0, min(line - 1, lines.count - 1))
+                var offset = 0
+                for i in 0..<targetLine {
+                    offset += lines[i].count + 1
+                }
+                offset = min(offset, length)
+                textView.setSelectedRange(NSRange(location: offset, length: 0))
+                textView.scrollRangeToVisible(NSRange(location: offset, length: 0))
+
+            case .save:
+                parent.onSave?()
+
+            case .quit:
+                break
+
+            case .visualDelete:
+                textView.visualCursorOverride = nil
+                if wasInBlockMode && !lastBlockRanges.isEmpty {
+                    let ranges = lastBlockRanges
+                    clearBlockHighlights(in: textView)
+                    var yanked = ""
+                    var deletedOffset = 0
+                    for range in ranges {
+                        let adjusted = NSRange(location: range.location - deletedOffset, length: range.length)
+                        let currentStr = textView.string as NSString
+                        yanked += currentStr.substring(with: adjusted) + "\n"
+                        textView.setSelectedRange(adjusted)
+                        textView.delete(nil)
+                        deletedOffset += range.length
+                    }
+                    parent.vimEngine.register = yanked
+                    parent.vimEngine.statusMessage = "\(ranges.count) lines block deleted"
+                    wasInBlockMode = false
+                } else {
+                    clearBlockHighlights(in: textView)
+                    let sel = textView.selectedRange()
+                    if sel.length > 0 {
+                        parent.vimEngine.register = nsString.substring(with: sel)
+                        textView.setSelectedRange(sel)
+                        textView.delete(nil)
+                        parent.vimEngine.statusMessage = "\(sel.length) chars deleted"
+                    }
+                }
+                textView.updateCursorAppearance(isBlock: true)
+
+            case .visualYank:
+                textView.visualCursorOverride = nil
+                if wasInBlockMode && !lastBlockRanges.isEmpty {
+                    let ranges = lastBlockRanges
+                    clearBlockHighlights(in: textView)
+                    var yanked = ""
+                    for range in ranges {
+                        yanked += nsString.substring(with: range) + "\n"
+                    }
+                    parent.vimEngine.register = yanked
+                    parent.vimEngine.statusMessage = "\(ranges.count) lines block yanked"
+                    wasInBlockMode = false
+                } else {
+                    clearBlockHighlights(in: textView)
+                    let sel = textView.selectedRange()
+                    if sel.length > 0 {
+                        parent.vimEngine.register = nsString.substring(with: sel)
+                        parent.vimEngine.statusMessage = "\(sel.length) chars yanked"
+                        flashYankHighlight(range: sel, in: textView)
+                    }
+                    textView.setSelectedRange(NSRange(location: sel.location, length: 0))
+                }
+                textView.updateCursorAppearance(isBlock: true)
+
+            case .visualChange:
+                textView.visualCursorOverride = nil
+                if wasInBlockMode && !lastBlockRanges.isEmpty {
+                    let ranges = lastBlockRanges
+                    clearBlockHighlights(in: textView)
+                    var yanked = ""
+                    var deletedOffset = 0
+                    for range in ranges {
+                        let adjusted = NSRange(location: range.location - deletedOffset, length: range.length)
+                        let currentStr = textView.string as NSString
+                        yanked += currentStr.substring(with: adjusted) + "\n"
+                        textView.setSelectedRange(adjusted)
+                        textView.delete(nil)
+                        deletedOffset += range.length
+                    }
+                    parent.vimEngine.register = yanked
+                    wasInBlockMode = false
+                } else {
+                    clearBlockHighlights(in: textView)
+                    let sel = textView.selectedRange()
+                    if sel.length > 0 {
+                        parent.vimEngine.register = nsString.substring(with: sel)
+                        textView.setSelectedRange(sel)
+                        textView.delete(nil)
+                    }
+                }
+                textView.updateCursorAppearance(isBlock: false)
+
+            case .visualIndent:
+                let sel = textView.selectedRange()
+                let lineRange = nsString.lineRange(for: sel)
+                var offset = 0
+                var pos = lineRange.location
+                while pos < lineRange.location + lineRange.length + offset {
+                    let currentNsString = textView.string as NSString
+                    let lr = currentNsString.lineRange(for: NSRange(location: pos, length: 0))
+                    textView.insertText("    ", replacementRange: NSRange(location: lr.location, length: 0))
+                    offset += 4
+                    pos = lr.location + lr.length + 4
+                }
+                textView.setSelectedRange(NSRange(location: lineRange.location, length: 0))
+                textView.updateCursorAppearance(isBlock: true)
+
+            case .visualOutdent:
+                let sel = textView.selectedRange()
+                let lineRange = nsString.lineRange(for: sel)
+                var pos = lineRange.location
+                while pos < NSMaxRange(lineRange) {
+                    let currentNsString = textView.string as NSString
+                    let lr = currentNsString.lineRange(for: NSRange(location: min(pos, currentNsString.length - 1), length: 0))
+                    let lineText = currentNsString.substring(with: lr)
+                    var removeCount = 0
+                    for ch in lineText {
+                        if ch == " " && removeCount < 4 { removeCount += 1 }
+                        else if ch == "\t" && removeCount == 0 { removeCount = 1; break }
+                        else { break }
+                    }
+                    if removeCount > 0 {
+                        textView.setSelectedRange(NSRange(location: lr.location, length: removeCount))
+                        textView.delete(nil)
+                    }
+                    let newNsString = textView.string as NSString
+                    let newLr = newNsString.lineRange(for: NSRange(location: min(lr.location, newNsString.length - 1), length: 0))
+                    pos = newLr.location + newLr.length
+                }
+                textView.setSelectedRange(NSRange(location: lineRange.location, length: 0))
+                textView.updateCursorAppearance(isBlock: true)
+
+            case .visualBlockInsert:
+                textView.visualCursorOverride = nil
+                if !lastBlockRanges.isEmpty {
+                    let firstRange = lastBlockRanges[0]
+                    let ns = textView.string as NSString
+                    blockInsertColumn = columnForPosition(firstRange.location, in: ns)
+                    blockInsertFirstLineStart = ns.lineRange(for: NSRange(location: firstRange.location, length: 0)).location
+                    blockInsertLineCount = lastBlockRanges.count
+                    blockInsertStartPos = firstRange.location
+                    blockInsertIsAppend = false
+                    wasInBlockMode = true
+                    textView.setSelectedRange(NSRange(location: firstRange.location, length: 0))
+                }
+                clearBlockHighlights(in: textView)
+                textView.updateCursorAppearance(isBlock: false)
+
+            case .visualBlockAppend:
+                textView.visualCursorOverride = nil
+                if !lastBlockRanges.isEmpty {
+                    let firstRange = lastBlockRanges[0]
+                    let ns = textView.string as NSString
+                    blockInsertColumn = columnForPosition(firstRange.location + firstRange.length, in: ns)
+                    blockInsertFirstLineStart = ns.lineRange(for: NSRange(location: firstRange.location, length: 0)).location
+                    blockInsertLineCount = lastBlockRanges.count
+                    let insertPos = firstRange.location + firstRange.length
+                    blockInsertStartPos = insertPos
+                    blockInsertIsAppend = true
+                    wasInBlockMode = true
+                    textView.setSelectedRange(NSRange(location: insertPos, length: 0))
+                }
+                clearBlockHighlights(in: textView)
+                textView.updateCursorAppearance(isBlock: false)
+
+            case .deleteTextObject(let textObj):
+                let cursorPos = textView.selectedRange().location
+                let nsStr = textView.string as NSString
+                if let range = resolveTextObject(textObj, at: cursorPos, in: nsStr) {
+                    parent.vimEngine.register = nsStr.substring(with: range)
+                    textView.setSelectedRange(range)
+                    textView.delete(nil)
+                    let newPos = min(range.location, (textView.string as NSString).length - 1)
+                    textView.setSelectedRange(NSRange(location: max(newPos, 0), length: 0))
+                    textView.updateCursorAppearance(isBlock: true)
+                }
+
+            case .changeTextObject(let textObj):
+                let cursorPos = textView.selectedRange().location
+                let nsStr = textView.string as NSString
+                if let range = resolveTextObject(textObj, at: cursorPos, in: nsStr) {
+                    parent.vimEngine.register = nsStr.substring(with: range)
+                    textView.setSelectedRange(range)
+                    textView.delete(nil)
+                    textView.updateCursorAppearance(isBlock: false)
+                    if !isReplayingDot {
+                        insertModeStartContent = textView.string
+                        insertModeStartPos = textView.selectedRange().location
+                    }
+                }
+
+            case .yankTextObject(let textObj):
+                let cursorPos = textView.selectedRange().location
+                let nsStr = textView.string as NSString
+                if let range = resolveTextObject(textObj, at: cursorPos, in: nsStr) {
+                    parent.vimEngine.register = nsStr.substring(with: range)
+                    parent.vimEngine.statusMessage = "Yanked"
+                    flashYankHighlight(range: range, in: textView)
+                }
+
+            case .visualSwapAnchor:
+                let oldAnchor = visualAnchor
+                let oldCursor = visualCursorPos
+                visualAnchor = oldCursor
+                visualCursorPos = oldAnchor
+                textView.visualCursorOverride = visualCursorPos
+                if engine.mode == .visualBlock {
+                    updateBlockSelection(in: textView)
+                } else {
+                    updateVisualSelection(cursorAt: visualCursorPos, in: textView)
+                }
+
+            case .visualSelectTextObject(let textObj):
+                let pos = isVisual ? visualCursorPos : textView.selectedRange().location
+                let nsStr = textView.string as NSString
+                if let range = resolveTextObject(textObj, at: pos, in: nsStr) {
+                    visualAnchor = range.location
+                    visualCursorPos = range.location + range.length - 1
+                    textView.setSelectedRange(range)
+                    textView.scrollRangeToVisible(range)
+                }
+            }
+        }
+
+        private func resolveTextObject(_ textObject: TextObject, at pos: Int, in nsString: NSString) -> NSRange? {
+            let length = nsString.length
+            guard pos < length else { return nil }
+
+            switch textObject {
+            case .inner(let type):
+                return findTextObjectRange(type: type, at: pos, in: nsString, inner: true)
+            case .around(let type):
+                return findTextObjectRange(type: type, at: pos, in: nsString, inner: false)
+            }
+        }
+
+        private func findTextObjectRange(type: TextObjectType, at pos: Int, in nsString: NSString, inner: Bool) -> NSRange? {
+            let string = nsString as String
+
+            switch type {
+            case .doubleQuote:
+                return findQuoteRange(quote: "\"", at: pos, in: nsString, inner: inner)
+            case .singleQuote:
+                return findQuoteRange(quote: "'", at: pos, in: nsString, inner: inner)
+            case .backtick:
+                return findQuoteRange(quote: "`", at: pos, in: nsString, inner: inner)
+            case .paren:
+                return findPairRange(open: "(", close: ")", at: pos, in: nsString, inner: inner)
+            case .bracket:
+                return findPairRange(open: "[", close: "]", at: pos, in: nsString, inner: inner)
+            case .brace:
+                return findPairRange(open: "{", close: "}", at: pos, in: nsString, inner: inner)
+            case .angleBracket:
+                return findPairRange(open: "<", close: ">", at: pos, in: nsString, inner: inner)
+            case .word:
+                return findWordObject(at: pos, in: string, inner: inner, bigWord: false)
+            case .bigWord:
+                return findWordObject(at: pos, in: string, inner: inner, bigWord: true)
+            case .paragraph:
+                return findParagraphObject(at: pos, in: nsString, inner: inner)
+            case .tag:
+                return nil
+            }
+        }
+
+        private func findQuoteRange(quote: String, at pos: Int, in nsString: NSString, inner: Bool) -> NSRange? {
+            let lineRange = nsString.lineRange(for: NSRange(location: pos, length: 0))
+            let lineText = nsString.substring(with: lineRange)
+            let localPos = pos - lineRange.location
+            let quoteChar = quote.first!
+
+            var quotePositions: [Int] = []
+            for (i, ch) in lineText.enumerated() {
+                if ch == quoteChar {
+                    if i > 0 && lineText[lineText.index(lineText.startIndex, offsetBy: i - 1)] == "\\" {
+                        continue
+                    }
+                    quotePositions.append(i)
+                }
+            }
+
+            guard quotePositions.count >= 2 else { return nil }
+
+            var openIdx: Int?
+            var closeIdx: Int?
+
+            for i in stride(from: 0, to: quotePositions.count - 1, by: 2) {
+                let open = quotePositions[i]
+                let close = quotePositions[i + 1]
+                if localPos >= open && localPos <= close {
+                    openIdx = open
+                    closeIdx = close
+                    break
+                }
+            }
+
+            if openIdx == nil {
+                for i in stride(from: 0, to: quotePositions.count - 1, by: 2) {
+                    if quotePositions[i] > localPos {
+                        openIdx = quotePositions[i]
+                        closeIdx = quotePositions[i + 1]
+                        break
+                    }
+                }
+            }
+
+            guard let open = openIdx, let close = closeIdx else { return nil }
+
+            if inner {
+                let start = lineRange.location + open + 1
+                let end = lineRange.location + close
+                return start < end ? NSRange(location: start, length: end - start) : nil
+            } else {
+                let start = lineRange.location + open
+                let end = lineRange.location + close + 1
+                return NSRange(location: start, length: end - start)
+            }
+        }
+
+        private func findPairRange(open: String, close: String, at pos: Int, in nsString: NSString, inner: Bool) -> NSRange? {
+            let length = nsString.length
+            let openChar: unichar = (open as NSString).character(at: 0)
+            let closeChar: unichar = (close as NSString).character(at: 0)
+
+            if pos < length && nsString.character(at: pos) == openChar {
+                if let closeIdx = findMatchingClose(openChar: openChar, closeChar: closeChar, from: pos, in: nsString) {
+                    return makePairResult(open: pos, close: closeIdx, inner: inner)
+                }
+                return nil
+            }
+
+            if pos < length && nsString.character(at: pos) == closeChar {
+                if let openIdx = findMatchingOpen(openChar: openChar, closeChar: closeChar, from: pos, in: nsString) {
+                    return makePairResult(open: openIdx, close: pos, inner: inner)
+                }
+                return nil
+            }
+
+            if let result = findEnclosingPair(openChar: openChar, closeChar: closeChar, at: pos, in: nsString, inner: inner) {
+                return result
+            }
+
+            let lineRange = nsString.lineRange(for: NSRange(location: pos, length: 0))
+            let lineEnd = lineRange.location + lineRange.length
+            var searchPos = pos + 1
+            while searchPos < lineEnd {
+                let ch = nsString.character(at: searchPos)
+                if ch == openChar {
+                    if let closeIdx = findMatchingClose(openChar: openChar, closeChar: closeChar, from: searchPos, in: nsString) {
+                        return makePairResult(open: searchPos, close: closeIdx, inner: inner)
+                    }
+                    return nil
+                }
+                searchPos += 1
+            }
+
+            return nil
+        }
+
+        private func findMatchingClose(openChar: unichar, closeChar: unichar, from openPos: Int, in nsString: NSString) -> Int? {
+            let length = nsString.length
+            var depth = 1
+            var searchPos = openPos + 1
+            while searchPos < length {
+                let ch = nsString.character(at: searchPos)
+                if ch == openChar { depth += 1 }
+                if ch == closeChar {
+                    depth -= 1
+                    if depth == 0 { return searchPos }
+                }
+                searchPos += 1
+            }
+            return nil
+        }
+
+        private func findMatchingOpen(openChar: unichar, closeChar: unichar, from closePos: Int, in nsString: NSString) -> Int? {
+            var depth = 1
+            var searchPos = closePos - 1
+            while searchPos >= 0 {
+                let ch = nsString.character(at: searchPos)
+                if ch == closeChar { depth += 1 }
+                if ch == openChar {
+                    depth -= 1
+                    if depth == 0 { return searchPos }
+                }
+                searchPos -= 1
+            }
+            return nil
+        }
+
+        private func findEnclosingPair(openChar: unichar, closeChar: unichar, at pos: Int, in nsString: NSString, inner: Bool) -> NSRange? {
+            let length = nsString.length
+            var depth = 0
+            var searchPos = pos - 1
+            while searchPos >= 0 {
+                let ch = nsString.character(at: searchPos)
+                if ch == closeChar { depth += 1 }
+                if ch == openChar {
+                    if depth == 0 {
+                        if let closeIdx = findMatchingClose(openChar: openChar, closeChar: closeChar, from: searchPos, in: nsString) {
+                            if closeIdx >= pos {
+                                return makePairResult(open: searchPos, close: closeIdx, inner: inner)
+                            }
+                        }
+                        return nil
+                    }
+                    depth -= 1
+                }
+                searchPos -= 1
+            }
+            return nil
+        }
+
+        private func makePairResult(open: Int, close: Int, inner: Bool) -> NSRange? {
+            if inner {
+                let start = open + 1
+                return start <= close ? NSRange(location: start, length: close - start) : nil
+            } else {
+                return NSRange(location: open, length: close - open + 1)
+            }
+        }
+
+        private func pasteContent() -> String {
+            let reg = parent.vimEngine.register
+            if !reg.isEmpty { return reg }
+            return NSPasteboard.general.string(forType: .string) ?? ""
+        }
+
+        private func findWordObject(at pos: Int, in string: String, inner: Bool, bigWord: Bool) -> NSRange? {
+            let chars = Array(string.unicodeScalars)
+            let length = chars.count
+            guard pos < length else { return nil }
+
+            let isWordChar: (Unicode.Scalar) -> Bool = bigWord
+                ? { !CharacterSet.whitespacesAndNewlines.contains($0) }
+                : { CharacterSet.alphanumerics.contains($0) || $0 == "_" }
+
+            let onWord = isWordChar(chars[pos])
+
+            if onWord {
+                var start = pos
+                while start > 0 && isWordChar(chars[start - 1]) { start -= 1 }
+                var end = pos
+                while end < length - 1 && isWordChar(chars[end + 1]) { end += 1 }
+
+                if !inner {
+                    while end < length - 1 && CharacterSet.whitespaces.contains(chars[end + 1]) { end += 1 }
+                }
+                return NSRange(location: start, length: end - start + 1)
+            } else {
+                var start = pos
+                while start > 0 && !isWordChar(chars[start - 1]) && !CharacterSet.newlines.contains(chars[start - 1]) { start -= 1 }
+                var end = pos
+                while end < length - 1 && !isWordChar(chars[end + 1]) && !CharacterSet.newlines.contains(chars[end + 1]) { end += 1 }
+                return NSRange(location: start, length: end - start + 1)
+            }
+        }
+
+        private func findParagraphObject(at pos: Int, in nsString: NSString, inner: Bool) -> NSRange? {
+            let length = nsString.length
+            guard length > 0 else { return nil }
+
+            var start = pos
+            while start > 0 {
+                if nsString.character(at: start - 1) == 0x0A {
+                    if start >= 2 && nsString.character(at: start - 2) == 0x0A { break }
+                    else if start == 1 { break }
+                }
+                start -= 1
+            }
+
+            var end = pos
+            while end < length {
+                if nsString.character(at: end) == 0x0A {
+                    if end + 1 < length && nsString.character(at: end + 1) == 0x0A {
+                        if !inner { end += 1 }
+                        break
+                    }
+                }
+                end += 1
+            }
+            if end >= length { end = length - 1 }
+
+            return NSRange(location: start, length: end - start + 1)
+        }
+
+        private func flashYankHighlight(range: NSRange, in textView: VimNSTextView) {
+            yankHighlightLayer?.removeFromSuperlayer()
+
+            guard let layoutManager = textView.layoutManager,
+                  let textContainer = textView.textContainer else { return }
+
+            let glyphRange = layoutManager.glyphRange(forCharacterRange: range, actualCharacterRange: nil)
+            let rect = layoutManager.boundingRect(forGlyphRange: glyphRange, in: textContainer)
+
+            var highlightRect = rect
+            highlightRect.origin.x += textView.textContainerOrigin.x
+            highlightRect.origin.y += textView.textContainerOrigin.y
+
+            let layer = CALayer()
+            layer.frame = highlightRect
+            layer.backgroundColor = NSColor.systemYellow.withAlphaComponent(0.35).cgColor
+            layer.cornerRadius = 2
+
+            textView.wantsLayer = true
+            textView.layer?.addSublayer(layer)
+            yankHighlightLayer = layer
+
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { [weak self] in
+                layer.removeFromSuperlayer()
+                if self?.yankHighlightLayer === layer {
+                    self?.yankHighlightLayer = nil
+                }
+            }
+        }
+
+        private func scheduleSearchHighlightClear(for textView: VimNSTextView) {
+            searchHighlightTimer?.cancel()
+            let work = DispatchWorkItem { [weak textView] in
+                textView?.clearSearchHighlights()
+            }
+            searchHighlightTimer = work
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5, execute: work)
+        }
+
+        private func searchAndMoveCursor(term: String, forward: Bool, in textView: VimNSTextView) {
+            let nsString = textView.string as NSString
+            let length = nsString.length
+            guard length > 0, !term.isEmpty else { return }
+
+            let cursorPos = textView.selectedRange().location
+
+            if forward {
+                let searchStart = min(cursorPos + 1, length)
+                if searchStart < length {
+                    let searchRange = NSRange(location: searchStart, length: length - searchStart)
+                    let found = nsString.range(of: term, options: [.caseInsensitive], range: searchRange)
+                    if found.location != NSNotFound {
+                        textView.setSelectedRange(NSRange(location: found.location, length: 0))
+                        textView.scrollRangeToVisible(found)
+                        flashSearchHighlight(range: found, in: textView)
+                        return
+                    }
+                }
+                let wrapRange = NSRange(location: 0, length: min(cursorPos + 1, length))
+                let found = nsString.range(of: term, options: [.caseInsensitive], range: wrapRange)
+                if found.location != NSNotFound {
+                    textView.setSelectedRange(NSRange(location: found.location, length: 0))
+                    textView.scrollRangeToVisible(found)
+                    flashSearchHighlight(range: found, in: textView)
+                    parent.vimEngine.statusMessage = "search hit BOTTOM, continuing at TOP"
+                } else {
+                    parent.vimEngine.statusMessage = "Pattern not found: \(term)"
+                }
+            } else {
+                if cursorPos > 0 {
+                    let searchRange = NSRange(location: 0, length: cursorPos)
+                    let found = nsString.range(of: term, options: [.caseInsensitive, .backwards], range: searchRange)
+                    if found.location != NSNotFound {
+                        textView.setSelectedRange(NSRange(location: found.location, length: 0))
+                        textView.scrollRangeToVisible(found)
+                        flashSearchHighlight(range: found, in: textView)
+                        return
+                    }
+                }
+                let wrapRange = NSRange(location: cursorPos, length: length - cursorPos)
+                let found = nsString.range(of: term, options: [.caseInsensitive, .backwards], range: wrapRange)
+                if found.location != NSNotFound {
+                    textView.setSelectedRange(NSRange(location: found.location, length: 0))
+                    textView.scrollRangeToVisible(found)
+                    flashSearchHighlight(range: found, in: textView)
+                    parent.vimEngine.statusMessage = "search hit TOP, continuing at BOTTOM"
+                } else {
+                    parent.vimEngine.statusMessage = "Pattern not found: \(term)"
+                }
+            }
+        }
+
+        private func flashSearchHighlight(range: NSRange, in textView: VimNSTextView) {
+            guard let layoutManager = textView.layoutManager,
+                  let textContainer = textView.textContainer else { return }
+
+            let glyphRange = layoutManager.glyphRange(forCharacterRange: range, actualCharacterRange: nil)
+            let rect = layoutManager.boundingRect(forGlyphRange: glyphRange, in: textContainer)
+
+            var highlightRect = rect
+            highlightRect.origin.x += textView.textContainerOrigin.x
+            highlightRect.origin.y += textView.textContainerOrigin.y
+
+            let layer = CALayer()
+            layer.frame = highlightRect
+            layer.backgroundColor = NSColor.systemOrange.withAlphaComponent(0.3).cgColor
+            layer.cornerRadius = 2
+            layer.borderWidth = 1
+            layer.borderColor = NSColor.systemOrange.withAlphaComponent(0.6).cgColor
+
+            textView.wantsLayer = true
+            textView.layer?.addSublayer(layer)
+
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
+                layer.removeFromSuperlayer()
+            }
+        }
+
+        private func updateVisualSelection(cursorAt newPos: Int, in textView: VimNSTextView) {
+            let nsString = textView.string as NSString
+            let length = nsString.length
+            let engine = parent.vimEngine
+
+            textView.visualCursorOverride = newPos
+
+            if engine.mode == .visualLine {
+                let anchorLineRange = nsString.lineRange(for: NSRange(location: min(visualAnchor, length - 1), length: 0))
+                let cursorLineRange = nsString.lineRange(for: NSRange(location: min(newPos, max(length - 1, 0)), length: 0))
+                let selStart = min(anchorLineRange.location, cursorLineRange.location)
+                let selEnd = max(NSMaxRange(anchorLineRange), NSMaxRange(cursorLineRange))
+                textView.setSelectedRange(NSRange(location: selStart, length: selEnd - selStart))
+            } else {
+                let anchor = min(visualAnchor, length)
+                let cursor = min(newPos, length)
+                if cursor >= anchor {
+                    let selLen = min(cursor - anchor + 1, length - anchor)
+                    textView.setSelectedRange(NSRange(location: anchor, length: max(selLen, 1)))
+                } else {
+                    textView.setSelectedRange(NSRange(location: cursor, length: anchor - cursor + 1))
+                }
+            }
+        }
+
+        private func columnForPosition(_ pos: Int, in nsString: NSString) -> Int {
+            let lineRange = nsString.lineRange(for: NSRange(location: pos, length: 0))
+            return pos - lineRange.location
+        }
+
+        private func positionForColumn(_ col: Int, inLineAt lineStart: Int, in nsString: NSString) -> Int {
+            let lineRange = nsString.lineRange(for: NSRange(location: lineStart, length: 0))
+            var lineEnd = lineRange.location + lineRange.length
+            if lineEnd > 0 && nsString.character(at: lineEnd - 1) == 0x0A {
+                lineEnd -= 1
+            }
+            let lineLength = lineEnd - lineRange.location
+            return lineRange.location + min(col, lineLength)
+        }
+
+        private func getBlockRanges(in textView: VimNSTextView) -> [NSRange] {
+            return lastBlockRanges
+        }
+
+        private func updateBlockSelection(in textView: VimNSTextView) {
+            let nsString = textView.string as NSString
+            let length = nsString.length
+            guard length > 0 else { return }
+
+            let anchorCol = columnForPosition(min(visualAnchor, length - 1), in: nsString)
+            let cursorCol = columnForPosition(min(visualCursorPos, length - 1), in: nsString)
+            let anchorLineRange = nsString.lineRange(for: NSRange(location: min(visualAnchor, length - 1), length: 0))
+            let cursorLineRange = nsString.lineRange(for: NSRange(location: min(visualCursorPos, length - 1), length: 0))
+
+            let startLine = min(anchorLineRange.location, cursorLineRange.location)
+            let endLine = max(anchorLineRange.location, cursorLineRange.location)
+            let leftCol = min(anchorCol, cursorCol)
+            let rightCol = max(anchorCol, cursorCol)
+
+            clearBlockHighlights(in: textView)
+            lastBlockRanges = []
+            wasInBlockMode = true
+
+            textView.wantsLayer = true
+            textView.visualCursorOverride = visualCursorPos
+
+            var lineStart = startLine
+            while lineStart <= endLine {
+                let lineRange = nsString.lineRange(for: NSRange(location: min(lineStart, length - 1), length: 0))
+                var lineEnd = lineRange.location + lineRange.length
+                if lineEnd > 0 && lineEnd <= length && nsString.character(at: lineEnd - 1) == 0x0A {
+                    lineEnd -= 1
+                }
+                let lineLength = lineEnd - lineRange.location
+
+                if leftCol < lineLength {
+                    let blockStart = lineRange.location + leftCol
+                    let blockEnd = lineRange.location + min(rightCol + 1, lineLength)
+                    let blockRange = NSRange(location: blockStart, length: blockEnd - blockStart)
+                    lastBlockRanges.append(blockRange)
+
+                    if let layoutManager = textView.layoutManager, let textContainer = textView.textContainer {
+                        let glyphRange = layoutManager.glyphRange(forCharacterRange: blockRange, actualCharacterRange: nil)
+                        let rect = layoutManager.boundingRect(forGlyphRange: glyphRange, in: textContainer)
+                        var highlightRect = rect
+                        highlightRect.origin.x += textView.textContainerOrigin.x
+                        highlightRect.origin.y += textView.textContainerOrigin.y
+
+                        let layer = CALayer()
+                        layer.frame = highlightRect
+                        layer.backgroundColor = NSColor.selectedTextBackgroundColor.withAlphaComponent(0.5).cgColor
+                        layer.name = "blockHighlight"
+                        textView.layer?.addSublayer(layer)
+                        blockHighlightLayers.append(layer)
+                    }
+                } else if leftCol <= lineLength {
+                    let blockRange = NSRange(location: lineRange.location + leftCol, length: 0)
+                    lastBlockRanges.append(blockRange)
+                }
+
+                lineStart = lineRange.location + lineRange.length
+                if lineStart == lineRange.location { break }
+            }
+
+            textView.setSelectedRange(NSRange(location: visualCursorPos, length: 0))
+        }
+
+        private func clearBlockHighlights(in textView: VimNSTextView) {
+            for layer in blockHighlightLayers {
+                layer.removeFromSuperlayer()
+            }
+            blockHighlightLayers.removeAll()
+        }
+
+        private func handleInsertEntry(_ entry: InsertEntry, in textView: VimNSTextView) {
+            let string = textView.string
+            let nsString = string as NSString
+            let cursorPos = textView.selectedRange().location
+            let length = nsString.length
+
+            switch entry {
+            case .beforeCursor:
+                break
+
+            case .afterCursor:
+                if cursorPos < length {
+                    textView.setSelectedRange(NSRange(location: cursorPos + 1, length: 0))
+                }
+
+            case .lineStart:
+                let lineRange = nsString.lineRange(for: NSRange(location: cursorPos, length: 0))
+                let lineText = nsString.substring(with: lineRange)
+                let indent = lineText.prefix(while: { $0 == " " || $0 == "\t" })
+                textView.setSelectedRange(NSRange(location: lineRange.location + indent.count, length: 0))
+
+            case .lineEnd:
+                let lineRange = nsString.lineRange(for: NSRange(location: cursorPos, length: 0))
+                var end = lineRange.location + lineRange.length
+                if end > 0 && end <= length && nsString.character(at: end - 1) == 0x0A {
+                    end -= 1
+                }
+                textView.setSelectedRange(NSRange(location: end, length: 0))
+
+            case .newLineBelow:
+                let lineRange = nsString.lineRange(for: NSRange(location: cursorPos, length: 0))
+                let lineEnd = lineRange.location + lineRange.length
+                let lineText = nsString.substring(with: lineRange)
+                let indent = String(lineText.prefix(while: { $0 == " " || $0 == "\t" }))
+                let hasNewline = lineEnd > 0 && lineEnd <= length && lineRange.length > 0 && nsString.character(at: lineEnd - 1) == 0x0A
+                if hasNewline {
+                    let insertPos = lineEnd
+                    let newText = indent + "\n"
+                    textView.setSelectedRange(NSRange(location: insertPos, length: 0))
+                    textView.insertText(newText, replacementRange: NSRange(location: insertPos, length: 0))
+                    textView.setSelectedRange(NSRange(location: insertPos + indent.count, length: 0))
+                } else {
+                    let insertPos = lineEnd
+                    let newText = "\n" + indent
+                    textView.setSelectedRange(NSRange(location: insertPos, length: 0))
+                    textView.insertText(newText, replacementRange: NSRange(location: insertPos, length: 0))
+                }
+
+            case .newLineAbove:
+                let lineRange = nsString.lineRange(for: NSRange(location: cursorPos, length: 0))
+                let lineText = nsString.substring(with: lineRange)
+                let indent = String(lineText.prefix(while: { $0 == " " || $0 == "\t" }))
+                let newText = indent + "\n"
+                textView.setSelectedRange(NSRange(location: lineRange.location, length: 0))
+                textView.insertText(newText, replacementRange: NSRange(location: lineRange.location, length: 0))
+                textView.setSelectedRange(NSRange(location: lineRange.location + indent.count, length: 0))
+            }
+        }
+
+        func resolveMotionNTimes(_ motion: Motion, count: Int, in textView: NSTextView) -> Int {
+            var pos = resolveMotion(motion, in: textView)
+            if count > 1 {
+                let savedRange = textView.selectedRange()
+                for _ in 1..<count {
+                    textView.setSelectedRange(NSRange(location: pos, length: 0))
+                    pos = resolveMotion(motion, in: textView)
+                }
+                textView.setSelectedRange(savedRange)
+            }
+            return pos
+        }
+
+        func resolveMotion(_ motion: Motion, in textView: NSTextView) -> Int {
+            let string = textView.string
+            let nsString = string as NSString
+            let cursorPos = textView.selectedRange().location
+            let length = nsString.length
+
+            guard length > 0 else { return 0 }
+
+            switch motion {
+            case .left:
+                let lineRange = nsString.lineRange(for: NSRange(location: cursorPos, length: 0))
+                return max(lineRange.location, cursorPos - 1)
+
+            case .right:
+                let lineRange = nsString.lineRange(for: NSRange(location: cursorPos, length: 0))
+                var lineEnd = lineRange.location + lineRange.length
+                if lineEnd > 0 && lineEnd <= length && nsString.character(at: lineEnd - 1) == 0x0A {
+                    lineEnd -= 1
+                }
+                return min(max(lineEnd - 1, lineRange.location), cursorPos + 1)
+
+            case .down:
+                return moveVertically(from: cursorPos, direction: 1, in: nsString)
+
+            case .up:
+                return moveVertically(from: cursorPos, direction: -1, in: nsString)
+
+            case .wordForward:
+                return findWordForward(from: cursorPos, in: string)
+
+            case .wordBackward:
+                return findWordBackward(from: cursorPos, in: string)
+
+            case .wordEnd:
+                return findWordEnd(from: cursorPos, in: string)
+
+            case .lineStart:
+                let lineRange = nsString.lineRange(for: NSRange(location: cursorPos, length: 0))
+                return lineRange.location
+
+            case .lineEnd:
+                let lineRange = nsString.lineRange(for: NSRange(location: cursorPos, length: 0))
+                var end = lineRange.location + lineRange.length
+                if end > 0 && end <= length && nsString.character(at: end - 1) == 0x0A {
+                    end -= 1
+                }
+                return max(end - 1, lineRange.location)
+
+            case .firstNonBlank:
+                let lineRange = nsString.lineRange(for: NSRange(location: cursorPos, length: 0))
+                let lineText = nsString.substring(with: lineRange)
+                let indent = lineText.prefix(while: { $0 == " " || $0 == "\t" })
+                return lineRange.location + indent.count
+
+            case .documentStart:
+                return 0
+
+            case .documentEnd:
+                if length > 0 {
+                    let lastLineRange = nsString.lineRange(for: NSRange(location: length - 1, length: 0))
+                    return lastLineRange.location
+                }
+                return 0
+
+            case .paragraphForward:
+                var pos = cursorPos
+                while pos < length && nsString.character(at: pos) != 0x0A { pos += 1 }
+                while pos < length && nsString.character(at: pos) == 0x0A { pos += 1 }
+                while pos < length {
+                    if nsString.character(at: pos) == 0x0A { break }
+                    pos += 1
+                }
+                return min(pos, length)
+
+            case .paragraphBackward:
+                var pos = cursorPos
+                if pos > 0 { pos -= 1 }
+                while pos > 0 && nsString.character(at: pos) == 0x0A { pos -= 1 }
+                while pos > 0 && nsString.character(at: pos) != 0x0A { pos -= 1 }
+                if pos > 0 { pos += 1 }
+                return pos
+
+            case .findChar(let ch, let forward):
+                return findCharInLine(ch, forward: forward, till: false, from: cursorPos, in: nsString)
+
+            case .tillChar(let ch, let forward):
+                return findCharInLine(ch, forward: forward, till: true, from: cursorPos, in: nsString)
+
+            case .matchingBracket:
+                return findMatchingBracket(from: cursorPos, in: nsString)
+            }
+        }
+
+        private func moveVertically(from pos: Int, direction: Int, in nsString: NSString) -> Int {
+            let length = nsString.length
+            guard length > 0 else { return 0 }
+
+            let currentLineRange = nsString.lineRange(for: NSRange(location: pos, length: 0))
+            let col = pos - currentLineRange.location
+
+            var targetLineStart: Int
+            if direction > 0 {
+                let nextLineStart = currentLineRange.location + currentLineRange.length
+                if nextLineStart >= length { return pos }
+                targetLineStart = nextLineStart
+            } else {
+                if currentLineRange.location == 0 { return pos }
+                let prevLineRange = nsString.lineRange(for: NSRange(location: currentLineRange.location - 1, length: 0))
+                targetLineStart = prevLineRange.location
+            }
+
+            let targetLineRange = nsString.lineRange(for: NSRange(location: targetLineStart, length: 0))
+            var targetLineLength = targetLineRange.length
+            if targetLineLength > 0 && (targetLineRange.location + targetLineLength) <= length {
+                if nsString.character(at: targetLineRange.location + targetLineLength - 1) == 0x0A {
+                    targetLineLength -= 1
+                }
+            }
+
+            let targetCol = min(col, max(targetLineLength - 1, 0))
+            return targetLineRange.location + targetCol
+        }
+
+        private func findWordForward(from pos: Int, in string: String) -> Int {
+            let chars = Array(string.unicodeScalars)
+            let length = chars.count
+            guard pos < length else { return pos }
+
+            var i = pos
+            let startType = charType(chars[i])
+
+            while i < length && charType(chars[i]) == startType { i += 1 }
+            while i < length && charType(chars[i]) == .whitespace { i += 1 }
+
+            return min(i, length)
+        }
+
+        private func findWordBackward(from pos: Int, in string: String) -> Int {
+            let chars = Array(string.unicodeScalars)
+            guard pos > 0 else { return 0 }
+
+            var i = pos - 1
+            while i > 0 && charType(chars[i]) == .whitespace { i -= 1 }
+            let targetType = charType(chars[i])
+            while i > 0 && charType(chars[i - 1]) == targetType { i -= 1 }
+
+            return i
+        }
+
+        private func findWordEnd(from pos: Int, in string: String) -> Int {
+            let chars = Array(string.unicodeScalars)
+            let length = chars.count
+            guard pos < length - 1 else { return pos }
+
+            var i = pos + 1
+            while i < length && charType(chars[i]) == .whitespace { i += 1 }
+            if i < length {
+                let targetType = charType(chars[i])
+                while i < length - 1 && charType(chars[i + 1]) == targetType { i += 1 }
+            }
+
+            return min(i, length - 1)
+        }
+
+        private enum CharType {
+            case word, punctuation, whitespace
+        }
+
+        private func charType(_ scalar: Unicode.Scalar) -> CharType {
+            if CharacterSet.whitespacesAndNewlines.contains(scalar) { return .whitespace }
+            if CharacterSet.alphanumerics.contains(scalar) || scalar == "_" { return .word }
+            return .punctuation
+        }
+
+        private func findCharInLine(_ ch: Character, forward: Bool, till: Bool, from pos: Int, in nsString: NSString) -> Int {
+            let lineRange = nsString.lineRange(for: NSRange(location: pos, length: 0))
+            let lineText = nsString.substring(with: lineRange)
+            let localPos = pos - lineRange.location
+
+            if forward {
+                if let range = lineText.dropFirst(localPos + 1).range(of: String(ch)) {
+                    let offset = lineText.distance(from: lineText.startIndex, to: range.lowerBound)
+                    let result = lineRange.location + offset
+                    return till ? result - 1 : result
+                }
+            } else {
+                let prefix = String(lineText.prefix(localPos))
+                if let range = prefix.range(of: String(ch), options: .backwards) {
+                    let offset = prefix.distance(from: prefix.startIndex, to: range.lowerBound)
+                    let result = lineRange.location + offset
+                    return till ? result + 1 : result
+                }
+            }
+            return pos
+        }
+
+        private func findMatchingBracket(from pos: Int, in nsString: NSString) -> Int {
+            let length = nsString.length
+            guard pos < length else { return pos }
+
+            let ch = Character(UnicodeScalar(nsString.character(at: pos))!)
+            let pairs: [Character: Character] = ["(": ")", "[": "]", "{": "}", ")": "(", "]": "[", "}": "{"]
+            let opening: Set<Character> = ["(", "[", "{"]
+
+            guard let match = pairs[ch] else { return pos }
+
+            if opening.contains(ch) {
+                var depth = 1
+                var i = pos + 1
+                while i < length && depth > 0 {
+                    let c = Character(UnicodeScalar(nsString.character(at: i))!)
+                    if c == ch { depth += 1 }
+                    else if c == match { depth -= 1 }
+                    if depth == 0 { return i }
+                    i += 1
+                }
+            } else {
+                var depth = 1
+                var i = pos - 1
+                while i >= 0 && depth > 0 {
+                    let c = Character(UnicodeScalar(nsString.character(at: i))!)
+                    if c == ch { depth += 1 }
+                    else if c == match { depth -= 1 }
+                    if depth == 0 { return i }
+                    i -= 1
+                }
+            }
+            return pos
+        }
+    }
+}
+
+class VimNSTextView: NSTextView {
+    var vimEngine: VimEngine?
+    weak var coordinator: VimTextView.Coordinator?
+    private var blockCursorLayer: CALayer?
+    var visualCursorOverride: Int? = nil
+    private var searchHighlightLayers: [CALayer] = []
+
+    func highlightAllMatches(term: String) {
+        clearSearchHighlights()
+        guard !term.isEmpty else { return }
+        let nsString = self.string as NSString
+        let length = nsString.length
+        guard length > 0 else { return }
+        guard let layoutManager = self.layoutManager,
+              let textContainer = self.textContainer else { return }
+
+        self.wantsLayer = true
+        var searchRange = NSRange(location: 0, length: length)
+        while searchRange.location < length {
+            let found = nsString.range(of: term, options: [.caseInsensitive], range: searchRange)
+            if found.location == NSNotFound { break }
+
+            let glyphRange = layoutManager.glyphRange(forCharacterRange: found, actualCharacterRange: nil)
+            let rect = layoutManager.boundingRect(forGlyphRange: glyphRange, in: textContainer)
+            var highlightRect = rect
+            highlightRect.origin.x += self.textContainerOrigin.x
+            highlightRect.origin.y += self.textContainerOrigin.y
+
+            let layer = CALayer()
+            layer.frame = highlightRect
+            layer.backgroundColor = NSColor.systemYellow.withAlphaComponent(0.3).cgColor
+            layer.cornerRadius = 2
+            layer.borderWidth = 0.5
+            layer.borderColor = NSColor.systemYellow.withAlphaComponent(0.5).cgColor
+            layer.name = "searchHighlight"
+            self.layer?.addSublayer(layer)
+            searchHighlightLayers.append(layer)
+
+            searchRange.location = found.location + found.length
+            searchRange.length = length - searchRange.location
+        }
+    }
+
+    func clearSearchHighlights() {
+        for layer in searchHighlightLayers {
+            layer.removeFromSuperlayer()
+        }
+        searchHighlightLayers.removeAll()
+    }
+
+    override var acceptsFirstResponder: Bool { true }
+
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        if window != nil {
+            DispatchQueue.main.async { [weak self] in
+                self?.window?.makeFirstResponder(self)
+            }
+        }
+    }
+
+    override func becomeFirstResponder() -> Bool {
+        let result = super.becomeFirstResponder()
+        if result {
+            updateCursorAppearance(isBlock: vimEngine?.mode.isEditing == false)
+        }
+        return result
+    }
+
+    override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        if event.modifierFlags.contains(.control) && event.charactersIgnoringModifiers == "v" {
+            if let engine = vimEngine, !engine.mode.isEditing {
+                return false
+            }
+        }
+        if event.modifierFlags.contains(.command) {
+            let hasShift = event.modifierFlags.contains(.shift)
+            if event.charactersIgnoringModifiers == "s" && !hasShift {
+                coordinator?.parent.onSave?()
+                vimEngine?.statusMessage = "Saved"
+                return true
+            }
+            if event.charactersIgnoringModifiers == "f" && !hasShift {
+                performTextFinderAction(NSTextFinder.Action.showFindInterface)
+                return true
+            }
+            if event.charactersIgnoringModifiers == "f" && hasShift {
+                return false
+            }
+            if event.charactersIgnoringModifiers == "g" {
+                if hasShift {
+                    performTextFinderAction(NSTextFinder.Action.previousMatch)
+                } else {
+                    performTextFinderAction(NSTextFinder.Action.nextMatch)
+                }
+                return true
+            }
+        }
+        return super.performKeyEquivalent(with: event)
+    }
+
+    override func keyDown(with event: NSEvent) {
+        guard let engine = vimEngine, let coordinator = coordinator else {
+            super.keyDown(with: event)
+            return
+        }
+
+        var modifiers: KeyModifiers = []
+        if event.modifierFlags.contains(.shift) { modifiers.insert(.shift) }
+        if event.modifierFlags.contains(.control) { modifiers.insert(.control) }
+        if event.modifierFlags.contains(.option) { modifiers.insert(.option) }
+        if event.modifierFlags.contains(.command) { modifiers.insert(.command) }
+
+        if modifiers.contains(.command) {
+            super.keyDown(with: event)
+            return
+        }
+
+        let isEsc = event.keyCode == 53
+        let isReturn = event.keyCode == 36
+        let isBackspace = event.keyCode == 51
+        let isTab = event.keyCode == 48
+
+        if engine.mode == .command {
+            if isEsc {
+                let actions = engine.processKey("escape")
+                coordinator.executeActions(actions)
+            } else if isReturn {
+                if engine.isSearchMode {
+                    let term = engine.commandLineText
+                    let forward = engine.searchForwardDirection
+                    engine.searchTerm = term
+                    engine.mode = .normal
+                    engine.showCommandLine = false
+                    engine.isSearchMode = false
+                    if !term.isEmpty {
+                        coordinator.executeActions([.searchExecute(term, forward)])
+                        engine.statusMessage = "/\(term)"
+                    }
+                } else {
+                    let actions = engine.executeCommand(engine.commandLineText)
+                    coordinator.executeActions(actions)
+                }
+            } else if isBackspace {
+                if !engine.commandLineText.isEmpty {
+                    engine.commandLineText.removeLast()
+                }
+            } else if let chars = event.characters {
+                engine.commandLineText += chars
+            }
+            return
+        }
+
+        if engine.mode.isEditing {
+            if isEsc {
+                let actions = engine.processKey("escape")
+                coordinator.executeActions(actions)
+                return
+            }
+
+            if modifiers.contains(.control) && event.characters == "[" {
+                let actions = engine.processKey("[", modifiers: modifiers)
+                coordinator.executeActions(actions)
+                return
+            }
+
+            super.keyDown(with: event)
+            return
+        }
+
+        if isEsc {
+            let actions = engine.processKey("escape")
+            coordinator.executeActions(actions)
+            return
+        }
+
+        if modifiers.contains(.control) && event.charactersIgnoringModifiers == "v" {
+            let actions = engine.processKey("v", modifiers: modifiers)
+            coordinator.executeActions(actions)
+            return
+        }
+
+        guard let chars = event.characters, !chars.isEmpty else { return }
+        let key = chars
+
+        if engine.keyBuffer == "r" && !isEsc {
+            engine.resetBuffers()
+            let pos = selectedRange().location
+            let nsString = string as NSString
+            if pos < nsString.length {
+                setSelectedRange(NSRange(location: pos, length: 1))
+                insertText(key, replacementRange: NSRange(location: pos, length: 1))
+                setSelectedRange(NSRange(location: pos, length: 0))
+                engine.recordNonInsertChange(actions: [.replaceChar])
+                engine.lastReplaceChar = key
+            }
+            return
+        }
+
+        let actions = engine.processKey(key, modifiers: modifiers)
+        coordinator.executeActions(actions)
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        super.mouseDown(with: event)
+        window?.makeFirstResponder(self)
+        if let engine = vimEngine, !engine.mode.isEditing {
+            updateCursorAppearance(isBlock: true)
+        }
+    }
+
+    func updateCursorAppearance(isBlock: Bool) {
+        if isBlock {
+            insertionPointColor = .clear
+            drawBlockCursor()
+        } else {
+            blockCursorLayer?.removeFromSuperlayer()
+            blockCursorLayer = nil
+            insertionPointColor = .systemOrange
+            setNeedsDisplay(bounds)
+        }
+    }
+
+    private func drawBlockCursor() {
+        blockCursorLayer?.removeFromSuperlayer()
+
+        guard let layoutManager = layoutManager, let textContainer = textContainer else { return }
+
+        let nsString = string as NSString
+        let isVisual = vimEngine?.mode.isVisual == true
+        let pos: Int
+        if isVisual, let override = visualCursorOverride {
+            pos = min(override, max(nsString.length - 1, 0))
+        } else {
+            pos = selectedRange().location
+        }
+
+        var glyphRange = NSRange(location: pos, length: 1)
+        if pos >= nsString.length {
+            if nsString.length > 0 {
+                glyphRange = NSRange(location: nsString.length - 1, length: 1)
+            } else {
+                let layer = CALayer()
+                layer.frame = NSRect(x: textContainerOrigin.x, y: textContainerOrigin.y, width: 8, height: font?.pointSize ?? 15)
+                layer.backgroundColor = NSColor.systemOrange.withAlphaComponent(0.4).cgColor
+                layer.cornerRadius = 1
+                self.wantsLayer = true
+                self.layer?.addSublayer(layer)
+                blockCursorLayer = layer
+                return
+            }
+        }
+
+        let charIndex = glyphRange.location
+        if charIndex < nsString.length {
+            let glyphIdx = layoutManager.glyphIndexForCharacter(at: charIndex)
+            var rect = layoutManager.boundingRect(forGlyphRange: NSRange(location: glyphIdx, length: 1), in: textContainer)
+            rect.origin.x += textContainerOrigin.x
+            rect.origin.y += textContainerOrigin.y
+
+            if rect.width < 2 {
+                rect.size.width = 8
+            }
+
+            let cursorColor: NSColor = isVisual
+                ? NSColor.systemOrange.withAlphaComponent(0.7)
+                : NSColor.systemOrange.withAlphaComponent(0.4)
+
+            let layer = CALayer()
+            layer.frame = rect
+            layer.backgroundColor = cursorColor.cgColor
+            layer.cornerRadius = 1
+
+            self.wantsLayer = true
+            self.layer?.addSublayer(layer)
+            blockCursorLayer = layer
+        }
+    }
+
+    override func setSelectedRange(_ charRange: NSRange) {
+        super.setSelectedRange(charRange)
+        if let engine = vimEngine, !engine.mode.isEditing {
+            DispatchQueue.main.async { [weak self] in
+                self?.drawBlockCursor()
+            }
+        }
+    }
+
+    override func didChangeText() {
+        super.didChangeText()
+        if let engine = vimEngine, !engine.mode.isEditing {
+            DispatchQueue.main.async { [weak self] in
+                self?.drawBlockCursor()
+            }
+        }
+    }
+}

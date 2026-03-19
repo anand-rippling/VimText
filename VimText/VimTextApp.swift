@@ -1,0 +1,46 @@
+import SwiftUI
+
+@main
+struct VimTextApp: App {
+    var body: some Scene {
+        WindowGroup {
+            ContentView()
+        }
+        .windowStyle(.titleBar)
+        .windowToolbarStyle(.unified(showsTitle: false))
+        .defaultSize(width: 1100, height: 700)
+        .commands {
+            CommandGroup(replacing: .newItem) {
+                Button("New Note") {
+                    NotificationCenter.default.post(name: .createNewNote, object: nil)
+                }
+                .keyboardShortcut("n", modifiers: .command)
+            }
+
+            CommandGroup(replacing: .textEditing) {
+                Button("Find in Notes") {
+                    NotificationCenter.default.post(name: .focusNoteSearch, object: nil)
+                }
+                .keyboardShortcut("f", modifiers: [.command, .shift])
+            }
+
+            CommandMenu("Vim") {
+                Text("Vim Keybindings Active")
+                Divider()
+                Text("Normal: Esc")
+                Text("Insert: i, a, o, O, I, A")
+                Text("Visual: v, V")
+                Text("Command: :")
+                Divider()
+                Text("Save: :w or ⌘S")
+                Text("Motions: h j k l w b e 0 $ gg G")
+                Text("Operations: d y c p")
+            }
+        }
+    }
+}
+
+extension Notification.Name {
+    static let createNewNote = Notification.Name("createNewNote")
+    static let focusNoteSearch = Notification.Name("focusNoteSearch")
+}
