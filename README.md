@@ -200,6 +200,12 @@ Notes are stored as individual JSON files in:
 
 Each note is a separate `.json` file with its content, title, timestamps, and metadata.
 
+## Support
+
+If you find VimText useful, consider buying me a coffee!
+
+[![Buy Me A Coffee](https://img.shields.io/badge/Buy%20Me%20A%20Coffee-ffdd00?style=for-the-badge&logo=buy-me-a-coffee&logoColor=black)](https://buymeacoffee.com/asranand7)
+
 ## License
 
 MIT
