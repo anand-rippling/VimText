@@ -18,6 +18,11 @@ struct VimTextApp: App {
             }
 
             CommandGroup(replacing: .textEditing) {
+                Button("Find in Note") {
+                    NotificationCenter.default.post(name: .findInNote, object: nil)
+                }
+                .keyboardShortcut("f", modifiers: .command)
+
                 Button("Find in Notes") {
                     NotificationCenter.default.post(name: .focusNoteSearch, object: nil)
                 }
@@ -43,4 +48,5 @@ struct VimTextApp: App {
 extension Notification.Name {
     static let createNewNote = Notification.Name("createNewNote")
     static let focusNoteSearch = Notification.Name("focusNoteSearch")
+    static let findInNote = Notification.Name("findInNote")
 }
