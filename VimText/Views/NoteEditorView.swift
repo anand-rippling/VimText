@@ -48,6 +48,12 @@ struct NoteEditorView: View {
                 isFindFieldFocused = true
             }
         }
+        .onReceive(NotificationCenter.default.publisher(for: .findInNote)) { _ in
+            withAnimation(.easeInOut(duration: 0.15)) {
+                findController.isVisible = true
+            }
+            findController.focusTrigger += 1
+        }
     }
 
     private var editorArea: some View {

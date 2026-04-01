@@ -96,6 +96,7 @@ struct VimTextView: NSViewRepresentable {
 
     func updateNSView(_ scrollView: NSScrollView, context: Context) {
         guard let textView = scrollView.documentView as? VimNSTextView else { return }
+        context.coordinator.parent = self
 
         if !context.coordinator.isUpdatingFromTextView && textView.string != text {
             let selectedRange = textView.selectedRange()
@@ -2004,14 +2005,11 @@ class VimNSTextView: NSTextView {
                         let nsString = string as NSString
                         fc.query = nsString.substring(with: sel)
                     }
-                    DispatchQueue.main.async {
-                        withAnimation(.easeInOut(duration: 0.15)) {
-                            fc.isVisible = true
-                        }
-                        fc.focusTrigger += 1
-                    }
+                    fc.isVisible = true
+                    fc.focusTrigger += 1
+                    return true
                 }
-                return true
+                return false
             }
             if event.charactersIgnoringModifiers == "f" && hasShift {
                 return false
