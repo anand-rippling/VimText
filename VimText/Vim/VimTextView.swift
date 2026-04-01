@@ -1,10 +1,25 @@
 import SwiftUI
 import AppKit
 
+class FindController: ObservableObject {
+    @Published var isVisible: Bool = false
+    @Published var query: String = ""
+    @Published var currentMatch: Int = 0
+    @Published var totalMatches: Int = 0
+    @Published var focusTrigger: Int = 0
+
+    var performFind: ((String) -> Void)?
+    var findNext: (() -> Void)?
+    var findPrev: (() -> Void)?
+    var dismiss: (() -> Void)?
+    var refocusEditor: (() -> Void)?
+}
+
 struct VimTextView: NSViewRepresentable {
     @Binding var text: String
     @Binding var rtfData: Data
     @ObservedObject var vimEngine: VimEngine
+    var findController: FindController?
     var onSave: (() -> Void)?
     var font: NSFont
     var startInInsertMode: Bool = false
@@ -35,8 +50,6 @@ struct VimTextView: NSViewRepresentable {
         textView.isContinuousSpellCheckingEnabled = false
         textView.isAutomaticTextCompletionEnabled = false
         textView.isAutomaticLinkDetectionEnabled = false
-        textView.usesFindBar = true
-        textView.isIncrementalSearchingEnabled = true
         textView.textContainerInset = NSSize(width: 16, height: 16)
 
         textView.minSize = NSSize(width: 0, height: 0)
@@ -65,6 +78,7 @@ struct VimTextView: NSViewRepresentable {
         context.coordinator.textView = textView
         context.coordinator.scrollView = scrollView
         context.coordinator.lastFontSize = font.pointSize
+        context.coordinator.setupFindController()
 
         // Load rich text content or fall back to plain text
         if !rtfData.isEmpty, let attrStr = NSAttributedString(rtf: rtfData, documentAttributes: nil) {
@@ -131,9 +145,102 @@ struct VimTextView: NSViewRepresentable {
         var insertModeStartPos: Int = 0
         var isReplayingDot: Bool = false
         var lastFontSize: CGFloat = 0
+        private var findMatchRanges: [NSRange] = []
+        private var currentFindIndex: Int = -1
 
         init(_ parent: VimTextView) {
             self.parent = parent
+        }
+
+        func setupFindController() {
+            guard let fc = parent.findController else { return }
+            fc.performFind = { [weak self] query in
+                self?.performFindInEditor(query: query)
+            }
+            fc.findNext = { [weak self] in
+                self?.navigateToNextFindMatch()
+            }
+            fc.findPrev = { [weak self] in
+                self?.navigateToPrevFindMatch()
+            }
+            fc.dismiss = { [weak self] in
+                self?.clearFindHighlights()
+            }
+            fc.refocusEditor = { [weak self] in
+                guard let tv = self?.textView else { return }
+                tv.window?.makeFirstResponder(tv)
+            }
+        }
+
+        private func performFindInEditor(query: String) {
+            guard let textView = textView else { return }
+            textView.clearSearchHighlights()
+            findMatchRanges = []
+            currentFindIndex = -1
+
+            guard !query.isEmpty else {
+                parent.findController?.totalMatches = 0
+                parent.findController?.currentMatch = 0
+                return
+            }
+
+            let nsString = textView.string as NSString
+            let length = nsString.length
+            var searchRange = NSRange(location: 0, length: length)
+
+            while searchRange.location < length {
+                let found = nsString.range(of: query, options: [.caseInsensitive], range: searchRange)
+                if found.location == NSNotFound { break }
+                findMatchRanges.append(found)
+                searchRange.location = found.location + found.length
+                searchRange.length = length - searchRange.location
+            }
+
+            textView.highlightAllMatches(term: query)
+
+            let fc = parent.findController
+            fc?.totalMatches = findMatchRanges.count
+
+            if !findMatchRanges.isEmpty {
+                let cursorPos = textView.selectedRange().location
+                currentFindIndex = 0
+                for (i, range) in findMatchRanges.enumerated() {
+                    if range.location >= cursorPos {
+                        currentFindIndex = i
+                        break
+                    }
+                }
+                navigateToFindMatch(in: textView)
+            } else {
+                fc?.currentMatch = 0
+            }
+        }
+
+        private func navigateToNextFindMatch() {
+            guard let textView = textView, !findMatchRanges.isEmpty else { return }
+            currentFindIndex = (currentFindIndex + 1) % findMatchRanges.count
+            navigateToFindMatch(in: textView)
+        }
+
+        private func navigateToPrevFindMatch() {
+            guard let textView = textView, !findMatchRanges.isEmpty else { return }
+            currentFindIndex = (currentFindIndex - 1 + findMatchRanges.count) % findMatchRanges.count
+            navigateToFindMatch(in: textView)
+        }
+
+        private func navigateToFindMatch(in textView: VimNSTextView) {
+            guard currentFindIndex >= 0 && currentFindIndex < findMatchRanges.count else { return }
+            let range = findMatchRanges[currentFindIndex]
+            textView.setSelectedRange(NSRange(location: range.location, length: 0))
+            textView.scrollRangeToVisible(range)
+            textView.highlightCurrentMatch(range: range)
+            parent.findController?.currentMatch = currentFindIndex + 1
+        }
+
+        private func clearFindHighlights() {
+            textView?.clearSearchHighlights()
+            findMatchRanges = []
+            currentFindIndex = -1
         }
 
         func textDidChange(_ notification: Notification) {
@@ -153,6 +260,13 @@ struct VimTextView: NSViewRepresentable {
 
             DispatchQueue.main.async {
                 self.isUpdatingFromTextView = false
+            }
+
+            if parent.findController?.isVisible == true,
+               let query = parent.findController?.query, !query.isEmpty {
+                DispatchQueue.main.async { [weak self] in
+                    self?.performFindInEditor(query: query)
+                }
             }
         }
 
@@ -1669,6 +1783,28 @@ class VimNSTextView: NSTextView {
     private var blockCursorLayer: CALayer?
     var visualCursorOverride: Int? = nil
     private var searchHighlightLayers: [CALayer] = []
+    private var currentMatchLayer: CALayer?
+
+    func highlightCurrentMatch(range: NSRange) {
+        currentMatchLayer?.removeFromSuperlayer()
+        guard let layoutManager = self.layoutManager,
+              let textContainer = self.textContainer else { return }
+        let glyphRange = layoutManager.glyphRange(forCharacterRange: range, actualCharacterRange: nil)
+        let rect = layoutManager.boundingRect(forGlyphRange: glyphRange, in: textContainer)
+        var highlightRect = rect
+        highlightRect.origin.x += self.textContainerOrigin.x
+        highlightRect.origin.y += self.textContainerOrigin.y
+        let layer = CALayer()
+        layer.frame = highlightRect
+        layer.backgroundColor = NSColor.systemOrange.withAlphaComponent(0.4).cgColor
+        layer.cornerRadius = 2
+        layer.borderWidth = 1.5
+        layer.borderColor = NSColor.systemOrange.withAlphaComponent(0.8).cgColor
+        layer.name = "currentMatchHighlight"
+        self.wantsLayer = true
+        self.layer?.addSublayer(layer)
+        currentMatchLayer = layer
+    }
 
     func highlightAllMatches(term: String) {
         clearSearchHighlights()
@@ -1711,6 +1847,8 @@ class VimNSTextView: NSTextView {
             layer.removeFromSuperlayer()
         }
         searchHighlightLayers.removeAll()
+        currentMatchLayer?.removeFromSuperlayer()
+        currentMatchLayer = nil
     }
 
     // MARK: - Rich Text Formatting
@@ -1860,19 +1998,33 @@ class VimNSTextView: NSTextView {
                 return true
             }
             if event.charactersIgnoringModifiers == "f" && !hasShift {
-                performTextFinderAction(NSTextFinder.Action.showFindInterface)
+                if let fc = coordinator?.parent.findController {
+                    let sel = selectedRange()
+                    if sel.length > 0 {
+                        let nsString = string as NSString
+                        fc.query = nsString.substring(with: sel)
+                    }
+                    DispatchQueue.main.async {
+                        withAnimation(.easeInOut(duration: 0.15)) {
+                            fc.isVisible = true
+                        }
+                        fc.focusTrigger += 1
+                    }
+                }
                 return true
             }
             if event.charactersIgnoringModifiers == "f" && hasShift {
                 return false
             }
             if event.charactersIgnoringModifiers == "g" {
-                if hasShift {
-                    performTextFinderAction(NSTextFinder.Action.previousMatch)
-                } else {
-                    performTextFinderAction(NSTextFinder.Action.nextMatch)
+                if let fc = coordinator?.parent.findController, fc.isVisible {
+                    if hasShift {
+                        fc.findPrev?()
+                    } else {
+                        fc.findNext?()
+                    }
+                    return true
                 }
-                return true
             }
             // Rich text formatting: Cmd+B (bold), Cmd+I (italic), Cmd+U (underline)
             if event.charactersIgnoringModifiers == "b" && !hasShift {
