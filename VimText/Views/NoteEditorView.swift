@@ -39,20 +39,16 @@ struct NoteEditorView: View {
         }
         .onAppear {
             loadNote()
+            findController.installKeyMonitor()
         }
         .onDisappear {
             saveCurrentNote()
+            findController.removeKeyMonitor()
         }
         .onChange(of: findController.focusTrigger) { _, _ in
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
                 isFindFieldFocused = true
             }
-        }
-        .onReceive(NotificationCenter.default.publisher(for: .findInNote)) { _ in
-            withAnimation(.easeInOut(duration: 0.15)) {
-                findController.isVisible = true
-            }
-            findController.focusTrigger += 1
         }
     }
 

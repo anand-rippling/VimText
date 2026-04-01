@@ -13,6 +13,52 @@ class FindController: ObservableObject {
     var findPrev: (() -> Void)?
     var dismiss: (() -> Void)?
     var refocusEditor: (() -> Void)?
+
+    private var eventMonitor: Any?
+
+    func installKeyMonitor() {
+        guard eventMonitor == nil else { return }
+        eventMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            guard let self = self else { return event }
+            let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+            if flags == .command, event.charactersIgnoringModifiers == "f" {
+                self.isVisible = true
+                self.focusTrigger += 1
+                return nil
+            }
+            if self.isVisible {
+                if flags == .command, event.charactersIgnoringModifiers == "g" {
+                    self.findNext?()
+                    return nil
+                }
+                if flags == [.command, .shift], event.charactersIgnoringModifiers == "g" {
+                    self.findPrev?()
+                    return nil
+                }
+                if event.keyCode == 53 {
+                    self.isVisible = false
+                    self.dismiss?()
+                    self.query = ""
+                    self.currentMatch = 0
+                    self.totalMatches = 0
+                    self.refocusEditor?()
+                    return nil
+                }
+            }
+            return event
+        }
+    }
+
+    func removeKeyMonitor() {
+        if let monitor = eventMonitor {
+            NSEvent.removeMonitor(monitor)
+            eventMonitor = nil
+        }
+    }
+
+    deinit {
+        removeKeyMonitor()
+    }
 }
 
 struct VimTextView: NSViewRepresentable {
